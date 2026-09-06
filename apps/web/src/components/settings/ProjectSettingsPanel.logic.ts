@@ -50,7 +50,7 @@ export function relinkProjectGroupingSettings(
   const newKey = derivePhysicalProjectKey(project);
   const overrides = settings.sidebarProjectGroupingOverrides;
   if (oldKey === newKey || overrides[oldKey] === undefined) return settings;
-  const nextOverrides = { ...overrides, [newKey]: overrides[oldKey] };
+  const nextOverrides = { ...overrides, [newKey]: overrides[newKey] ?? overrides[oldKey] };
   delete nextOverrides[oldKey];
   return { ...settings, sidebarProjectGroupingOverrides: nextOverrides };
 }
