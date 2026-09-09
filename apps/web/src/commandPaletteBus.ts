@@ -1,4 +1,9 @@
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, PullRequestLinkedThreadsResult } from "@t3tools/contracts";
+
+export interface CommandPaletteLinkedThreads {
+  readonly environmentId: EnvironmentId;
+  readonly threads: PullRequestLinkedThreadsResult["threads"];
+}
 
 // Tiny event bus allowing components to programmatically open the command palette
 // without owning its React state.
@@ -11,7 +16,11 @@ export interface FolderSelectionRequest {
 }
 
 export type CommandPaletteOpenDetail =
-  | { readonly open?: "add-project" | "new-thread-in" }
+  | {
+      readonly open?: "add-project" | "new-thread-in";
+      readonly query?: string;
+      readonly linkedThreads?: CommandPaletteLinkedThreads;
+    }
   | (FolderSelectionRequest & { readonly open: "select-folder" });
 
 export function openCommandPalette(detail?: CommandPaletteOpenDetail): void {
