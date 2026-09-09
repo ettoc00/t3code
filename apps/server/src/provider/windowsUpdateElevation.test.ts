@@ -70,6 +70,7 @@ for (const { mode, expectedCode } of [
                 "throw [InvalidOperationException]::new('fixture', [ComponentModel.Win32Exception]::new(1223))",
               )
             : launcher.replace("$start.Verb = 'runas'", "$start.Verb = ''");
+        assert.notStrictEqual(testLauncher, launcher, "launcher patch did not apply");
         const encoded = Buffer.from(testLauncher, "utf16le").toString("base64");
         const exitCode = yield* Effect.promise(
           () =>

@@ -731,8 +731,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
     "missing-uninstall-empty",
     "missing-uninstall-present",
     "missing-uninstall-unreadable",
+    "registry-failure",
   ]) {
-    it.effect(`keeps native/npm updates only for provably absent registry roots: ${failure}`, () =>
+    it.effect(`preserves proven npm ownership with inconclusive WinGet probes: ${failure}`, () =>
       Effect.gen(function* () {
         const f = yield* windowsFixture(failure);
         for (const segments of [
@@ -755,10 +756,32 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
             NodeFS.mkdirSync(NodePath.dirname(manifest), { recursive: true });
             NodeFS.writeFileSync(manifest, '{"name":"@example/package-tool"}');
           }
-          const result = yield* f.resolve(binary);
-          if (failure === "missing-uninstall" || failure === "missing-uninstall-empty")
-            expect(result.update?.executable).toBe(native ? binary : "npm");
-          else expect(result.update).toBeNull();
+          if (native) {
+            const result = yield* f.resolve(binary);
+            if (failure === "missing-uninstall" || failure === "missing-uninstall-empty")
+              expect(result.update?.executable).toBe(binary);
+            else expect(result.update).toBeNull();
+          } else {
+            const result = yield* resolveProviderMaintenanceCapabilitiesEffect(f.resolver, {
+              binaryPath: binary,
+              env: f.env,
+            }).pipe(
+              Effect.provideService(HostProcessPlatform, "win32"),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+            );
+            expect(result.update).toMatchObject({
+              executable: "npm",
+              args: [
+                "install",
+                "-g",
+                "--prefix",
+                NodePath.dirname(binary),
+                "--allow-scripts=@example/package-tool",
+                "@example/package-tool@latest",
+              ],
+            });
+            expect(result.latestVersion).toBeUndefined();
+          }
         }
       }).pipe(Effect.scoped),
     );

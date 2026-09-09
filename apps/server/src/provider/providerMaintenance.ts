@@ -562,7 +562,8 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
   }
 
   const packageId = definition.wingetPackageId;
-  if (!packageId) return null;
+  // Proven npm ownership must survive an inconclusive Windows registry probe.
+  if (!packageId || npmShim) return null;
   const registry = path.join(context.env.SystemRoot ?? "C:\\Windows", "System32", "reg.exe");
   const currentVersion = "Software\\Microsoft\\Windows\\CurrentVersion";
   const uninstall = `${currentVersion}\\Uninstall`;
