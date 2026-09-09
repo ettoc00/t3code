@@ -126,8 +126,7 @@ import {
 import {
   checkoutKey,
   projectGroupTitleNeedsUpdate,
-  relinkProjectGroupingSettings,
-  relinkProjectUiState,
+  relinkProjectPreferences,
   resolveSettingsProjectGroup,
 } from "./ProjectSettingsPanel.logic";
 import { openCommandPalette } from "../../commandPaletteBus";
@@ -179,10 +178,14 @@ export function ProjectSettingsPanel({
   environmentId?: EnvironmentId | null;
 }) {
   const groups = useSettingsProjectGroups();
+  const projects = useProjects();
   const navigate = useNavigate();
   const { checkout } = useSearch({ from: "/settings/projects" });
 
-  const selected = resolveSettingsProjectGroup(groups, projectKey, checkout);
+  const selected = useMemo(
+    () => resolveSettingsProjectGroup(groups, projectKey, checkout, projects),
+    [groups, projectKey, checkout, projects],
+  );
   const members = useMemo(
     () =>
       selected?.memberProjects.filter(
@@ -245,6 +248,11 @@ export function ProjectSettingsPanel({
         This project has no checkout on this machine.
       </p>
     );
+  if (checkout && !members.some((member) => checkoutKey(member) === checkout)) {
+    return (
+      <p className="p-8 text-sm text-muted-foreground">This checkout is no longer available.</p>
+    );
+  }
   const scopedGroup = {
     ...selected,
     memberProjects: members,
@@ -977,14 +985,21 @@ function ProjectDetail({
         normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
     );
     if (!project) return true;
-    const settings = selectProjectGroupingSettings(getClientSettings());
-    useUiStateStore.setState((state) =>
-      relinkProjectUiState(state, { previous, project, projects, settings }),
-    );
-    const nextSettings = relinkProjectGroupingSettings(settings, previous, project);
-    if (nextSettings !== settings) {
+    const settings = getClientSettings();
+    const next = relinkProjectPreferences(useUiStateStore.getState(), {
+      previous,
+      project,
+      projects,
+      settings,
+    });
+    useUiStateStore.setState(next.uiState);
+    if (
+      next.settings.sidebarProjectGroupingOverrides !== settings.sidebarProjectGroupingOverrides ||
+      next.settings.pullRequestMergeMethodOverrides !== settings.pullRequestMergeMethodOverrides
+    ) {
       updateClientSettings({
-        sidebarProjectGroupingOverrides: nextSettings.sidebarProjectGroupingOverrides,
+        sidebarProjectGroupingOverrides: next.settings.sidebarProjectGroupingOverrides,
+        pullRequestMergeMethodOverrides: next.settings.pullRequestMergeMethodOverrides,
       });
     }
     return true;
