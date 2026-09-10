@@ -592,7 +592,10 @@ function OpenCommandPaletteDialog(props: {
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, completeFolderSelection, openIntent, openOverlayMode, setOpen } = props;
   const folderSelection = openIntent?.kind === "select-folder" ? openIntent : null;
-  const [isSelectingFolder, setIsSelectingFolder] = useState(false);
+  const pendingFolderSelectionRef = useRef<FolderSelectionRequest | null>(null);
+  const [pendingFolderSelection, setPendingFolderSelection] =
+    useState<FolderSelectionRequest | null>(null);
+  const isSelectingFolder = folderSelection !== null && pendingFolderSelection === folderSelection;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
   const [linkedThreadSearch, setLinkedThreadSearch] = useState(
     openIntent?.kind === "search" ? openIntent : null,
@@ -2013,12 +2016,16 @@ function OpenCommandPaletteDialog(props: {
     async (rawCwd: string) => {
       if (!browseEnvironmentId) return;
       if (folderSelection) {
-        if (isSelectingFolder) return;
-        setIsSelectingFolder(true);
+        if (pendingFolderSelectionRef.current === folderSelection) return;
+        pendingFolderSelectionRef.current = folderSelection;
+        setPendingFolderSelection(folderSelection);
         try {
           completeFolderSelection(folderSelection, await folderSelection.onSelect(rawCwd));
         } finally {
-          setIsSelectingFolder(false);
+          if (pendingFolderSelectionRef.current === folderSelection) {
+            pendingFolderSelectionRef.current = null;
+            setPendingFolderSelection(null);
+          }
         }
         return;
       }
@@ -2035,7 +2042,6 @@ function OpenCommandPaletteDialog(props: {
       currentProjectCwdForBrowse,
       handleAddProjectForEnvironment,
       folderSelection,
-      isSelectingFolder,
       completeFolderSelection,
     ],
   );
