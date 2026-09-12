@@ -1,3 +1,4 @@
+import { serializeProjectFolderUpdate } from "../../state/projectFolderUpdate";
 import { describe, expect, it } from "vite-plus/test";
 import { defaultParseSearch, defaultStringifySearch } from "@tanstack/react-router";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -532,5 +533,76 @@ describe("projectGroupTitleNeedsUpdate", () => {
     expect(projectGroupTitleNeedsUpdate(["Shared name", "Shared name"], "Shared name", true)).toBe(
       false,
     );
+  });
+});
+
+function deferredUpdate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+describe("concurrent checkout folder updates", () => {
+  it("hands preferences through intermediate paths before the next update reads its source", async () => {
+    let project = checkout("/old");
+    let settings = grouping("repository");
+    settings.sidebarProjectGroupingOverrides[derivePhysicalProjectKey(project)] = "separate";
+    let state = collapsed(project, settings);
+    const ref = { environmentId: project.environmentId, projectId: project.id };
+    const started = deferredUpdate();
+    const release = deferredUpdate();
+    const sources: string[] = [];
+    const update = (path: string, pause = false) =>
+      serializeProjectFolderUpdate(ref, async () => {
+        const previous = project;
+        sources.push(previous.workspaceRoot);
+        if (pause) {
+          started.resolve();
+          await release.promise;
+        }
+        project = { ...previous, workspaceRoot: path };
+        const next = relinkProjectPreferences(state, {
+          previous,
+          project,
+          projects: [project],
+          settings,
+        });
+        settings = next.settings;
+        state = next.uiState;
+      });
+    const first = update("/intermediate", true);
+    await started.promise;
+    const second = update("/final");
+    // Different registrations remain usable while this checkout is pending.
+    await serializeProjectFolderUpdate(
+      { ...ref, projectId: ProjectId.make("other") },
+      async () => undefined,
+    );
+    expect(sources).toEqual(["/old"]);
+    release.resolve();
+    await Promise.all([first, second]);
+    expect(sources).toEqual(["/old", "/intermediate"]);
+    expect(settings.sidebarProjectGroupingOverrides).toEqual({
+      [derivePhysicalProjectKey(project)]: "separate",
+    });
+    expect(state.projectOrder).toEqual([derivePhysicalProjectKey(project)]);
+    const groupKey = deriveLogicalProjectKeyFromSettings(project, settings);
+    expect(state.sidebarProjectScopeKey).toBe(groupKey);
+    expect(state.projectExpandedById[groupKey]).toBe(false);
+  });
+
+  it("allows a queued recovery after a rejected update", async () => {
+    const ref = {
+      environmentId: EnvironmentId.make("failure-env"),
+      projectId: ProjectId.make("project"),
+    };
+    const failure = serializeProjectFolderUpdate(ref, async () => {
+      throw new Error("unavailable");
+    });
+    const next = serializeProjectFolderUpdate(ref, async () => "recovered");
+    await expect(failure).rejects.toThrow("unavailable");
+    await expect(next).resolves.toBe("recovered");
   });
 });

@@ -174,3 +174,20 @@ export function relinkProjectPreferences(
     },
   };
 }
+
+/** Follow remembered registrations when a remote relink invalidates a path-based selection. */
+export function resolveSettingsProjectSuccessor(
+  groups: ReadonlyArray<SidebarProjectSnapshot>,
+  memberKeys: ReadonlyArray<string>,
+  checkout: string | null,
+) {
+  for (const group of groups) {
+    const member = group.memberProjects.find((item) => memberKeys.includes(checkoutKey(item)));
+    if (member)
+      return {
+        project: group.projectKey,
+        checkout: checkout === null ? undefined : checkoutKey(member),
+      };
+  }
+  return null;
+}
