@@ -182,11 +182,16 @@ export function resolveSettingsProjectSuccessor(
   checkout: string | null,
 ) {
   for (const group of groups) {
-    const member = group.memberProjects.find((item) => memberKeys.includes(checkoutKey(item)));
+    const member = group.memberProjectRefs.find((item) =>
+      memberKeys.includes(checkoutKey({ environmentId: item.environmentId, id: item.projectId })),
+    );
     if (member)
       return {
         project: group.projectKey,
-        checkout: checkout === null ? undefined : checkoutKey(member),
+        checkout:
+          checkout === null
+            ? undefined
+            : checkoutKey({ environmentId: member.environmentId, id: member.projectId }),
       };
   }
   return null;

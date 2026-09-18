@@ -318,6 +318,11 @@ describe("folder selection completion", () => {
         reduceCommandPaletteUiState(state, { _tag: "OpenAddProject" }),
     ],
     [
+      "theme picker",
+      (state: CommandPaletteUiState) =>
+        reduceCommandPaletteUiState(state, { _tag: "OpenChangeTheme" }),
+    ],
+    [
       "linked PR search",
       (state: CommandPaletteUiState) =>
         reduceCommandPaletteUiState(state, {
@@ -343,6 +348,18 @@ describe("folder selection completion", () => {
         selected: true,
       }),
     ).toBe(current);
+  });
+
+  it("replaces a theme picker with folder selection", () => {
+    const themePicker = reduceCommandPaletteUiState(
+      { open: false, mode: "command", openIntent: null },
+      { _tag: "OpenChangeTheme" },
+    );
+    expect(reduceCommandPaletteUiState(themePicker, { _tag: "SelectFolder", request })).toEqual({
+      open: true,
+      mode: "command",
+      openIntent: { ...request, kind: "select-folder" },
+    });
   });
 
   function assertFolderIntent(

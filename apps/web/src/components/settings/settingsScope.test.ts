@@ -284,3 +284,23 @@ it("recovers a legacy path selection after a remote move without selecting its s
     ),
   ).toBeNull();
 });
+
+it("follows a hidden registration by its remembered checkout ID", () => {
+  const hidden = { ...first, id: ProjectId.make("hidden") };
+  const moved = { ...first, workspaceRoot: "/renamed", physicalProjectKey: "laptop:/renamed" };
+  const destination = {
+    ...group("renamed", [moved]),
+    memberProjectRefs: [
+      { environmentId: moved.environmentId, projectId: moved.id },
+      { environmentId: hidden.environmentId, projectId: hidden.id },
+    ],
+  };
+
+  expect(
+    resolveSettingsProjectSuccessor(
+      [group("t3code", [second, third]), destination],
+      [checkoutKey(hidden)],
+      first.physicalProjectKey,
+    ),
+  ).toEqual({ project: "renamed", checkout: checkoutKey(hidden) });
+});

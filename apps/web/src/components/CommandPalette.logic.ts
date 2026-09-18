@@ -61,9 +61,8 @@ export function browseInputEndPaddingClass(input: {
 export type SearchOverlayMode = "command" | "files" | "content";
 
 export type CommandPaletteOpenIntent =
-  | { readonly kind: "add-project" | "new-thread-in" }
+  | { readonly kind: "add-project" | "new-thread-in" | "change-theme" }
   | (FolderSelectionRequest & { readonly kind: "select-folder" })
-  | { readonly kind: "change-theme" }
   | {
       readonly kind: "search";
       readonly query: string;

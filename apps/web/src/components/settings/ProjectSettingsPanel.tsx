@@ -104,27 +104,53 @@ export function ProjectSettingsPanel({
     [selected, environmentId, checkoutKey],
   );
 
-  // Remember the members of the last rendered group so a grouping-rule change
-  // (which changes the group key) can follow the project to its new group.
-  const lastSelectionRef = useRef<{
+  type RememberedSelection = {
     key: string;
     environmentId: EnvironmentId | null;
     checkoutKey: string | null;
     memberKeys: string[];
-  } | null>(null);
-  useEffect(() => {
-    if (!selected || members.length === 0) return;
-    lastSelectionRef.current = {
-      key: selected.projectKey,
-      environmentId,
-      checkoutKey,
-      memberKeys: members.map(stableCheckoutKey),
-    };
-  }, [selected, members, environmentId, checkoutKey]);
+  };
+  const currentSelection: RememberedSelection | null =
+    selected && members.length > 0
+      ? {
+          key: selected.projectKey,
+          environmentId,
+          checkoutKey,
+          memberKeys: members.map(stableCheckoutKey),
+        }
+      : null;
+  // Keep the registration IDs from the prior render until navigation has had
+  // a chance to follow them. A legacy path key can otherwise resolve to a
+  // sibling that remains at the old path after the intended checkout moves.
+  const lastSelectionRef = useRef<RememberedSelection | null>(currentSelection);
 
   // A grouping-rule change replaces the group key mid-visit; follow the
   // project to its new key instead of parking on the not-found state.
   useEffect(() => {
+    const last = lastSelectionRef.current;
+    if (
+      last?.key === projectKey &&
+      last.environmentId === environmentId &&
+      last.checkoutKey === checkoutKey
+    ) {
+      const successor = resolveSettingsProjectSuccessor(groups, last.memberKeys, checkoutKey);
+      if (
+        successor &&
+        (successor.project !== projectKey || (successor.checkout ?? null) !== checkoutKey)
+      ) {
+        void navigate({
+          to: pathname,
+          search: () => ({
+            project: successor.project,
+            machine: environmentId ?? undefined,
+            checkout: successor.checkout,
+          }),
+          replace: true,
+          hashScrollIntoView: false,
+        });
+        return;
+      }
+    }
     if (members.length > 0) {
       if (selected && selected.projectKey !== projectKey) {
         void navigate({
@@ -135,7 +161,6 @@ export function ProjectSettingsPanel({
       }
       return;
     }
-    const last = lastSelectionRef.current;
     if (
       last?.key !== projectKey ||
       last.environmentId !== environmentId ||
@@ -165,6 +190,10 @@ export function ProjectSettingsPanel({
     checkoutKey,
     selected,
   ]);
+
+  useEffect(() => {
+    if (currentSelection) lastSelectionRef.current = currentSelection;
+  }, [currentSelection]);
 
   if (!selected) {
     return (

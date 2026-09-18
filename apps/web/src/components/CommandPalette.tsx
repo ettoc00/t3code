@@ -2485,7 +2485,7 @@ function OpenCommandPaletteDialog(props: {
         }
         return;
       }
-      await handleAddProject(cloneResult.value.cwd);
+      await handleSubmitBrowsePath(cloneResult.value.cwd);
       return;
     }
 
@@ -2523,7 +2523,7 @@ function OpenCommandPaletteDialog(props: {
     // The create event usually lands before this call returns; give the shell
     // stream a moment so the draft opens with its project resolved instead of
     // flashing the project picker.
-    await waitForProject(projectRef, 3_000).catch(() => null);
+    await waitForProject(projectRef, { timeoutMs: 3_000 }).catch(() => null);
     const navigationResult = await settlePromise(() => handleNewThread(projectRef));
     if (navigationResult._tag === "Failure") {
       const error = squashAtomCommandFailure(navigationResult);
