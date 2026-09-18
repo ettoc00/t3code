@@ -31,6 +31,7 @@ import {
 import {
   applyProjectFolderPreferenceHandoff,
   beginProjectFolderPreferenceHandoff,
+  isProjectFolderPreferenceHandoffCurrent,
   serializeProjectFolderUpdate,
   type ProjectFolderPreferenceHandoff,
 } from "../../state/projectFolderUpdate";
@@ -60,7 +61,7 @@ import {
 } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 
-import { persistClientSettingsUpdate } from "../../hooks/useSettings";
+import { persistGuardedClientSettingsUpdate } from "../../hooks/useSettings";
 import { openCommandPalette } from "../../commandPaletteBus";
 import { getBrowseParentPath, normalizeProjectPathForComparison } from "../../lib/projectPaths";
 import { useUiStateStore } from "../../uiStateStore";
@@ -473,29 +474,60 @@ function ProjectDetail({
       );
       if (result._tag === "Failure") return false;
       const selectedPath = normalizeProjectPathForComparison(workspaceRoot);
-      if (normalizeProjectPathForComparison(previous.workspaceRoot) === selectedPath) return true;
       const handoff = beginProjectFolderPreferenceHandoff(ref, previous);
       const applyPreferences = async (pending: ProjectFolderPreferenceHandoff<typeof previous>) => {
-        const projects = readProjects();
-        const project = projects.find(
-          (item) =>
-            item.environmentId === ref.environmentId &&
-            item.id === ref.projectId &&
-            normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
-        );
-        if (!project) return;
         const preferences = await settlePromise(() =>
-          applyProjectFolderPreferenceHandoff(pending, project, async (preferenceSource) => {
-            await persistClientSettingsUpdate((settings) => {
+          applyProjectFolderPreferenceHandoff(pending, async (preferenceSource) => {
+            const persisted = await persistGuardedClientSettingsUpdate((settings) => {
+              if (!isProjectFolderPreferenceHandoffCurrent(pending)) return null;
+              const currentProject = readProject(ref);
+              if (
+                currentProject === null ||
+                normalizeProjectPathForComparison(currentProject.workspaceRoot) !== selectedPath
+              ) {
+                return null;
+              }
+              const projects = readProjects();
+              const project = projects.find(
+                (item) =>
+                  item.environmentId === ref.environmentId &&
+                  item.id === ref.projectId &&
+                  normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
+              );
+              if (!project) return null;
+              const isCurrent = () =>
+                isProjectFolderPreferenceHandoffCurrent(pending) &&
+                readProject(ref) === currentProject;
               const next = relinkProjectPreferences(useUiStateStore.getState(), {
                 previous: preferenceSource,
                 project,
                 projects,
                 settings,
               });
-              useUiStateStore.setState(next.uiState);
-              return next.settings;
+              return {
+                settings: next.settings,
+                value: { currentProject, project, projects },
+                isCurrent,
+              };
             });
+            if (persisted === null) return false;
+            if (!isProjectFolderPreferenceHandoffCurrent(pending)) return false;
+            const { currentProject, project, projects } = persisted.value;
+            if (readProject(ref) !== currentProject) return false;
+            const next = relinkProjectPreferences(useUiStateStore.getState(), {
+              previous: preferenceSource,
+              project,
+              projects,
+              settings: persisted.previousSettings,
+            });
+            if (
+              !isProjectFolderPreferenceHandoffCurrent(pending) ||
+              readProject(ref) !== currentProject
+            ) {
+              return false;
+            }
+            useUiStateStore.setState(next.uiState);
+            return true;
           }),
         );
         reportFailure(

@@ -209,24 +209,72 @@ export function persistClientSettingsPatch(
  * updater is reapplied to that newer snapshot and persisted again so neither
  * change is lost.
  */
-export async function persistClientSettingsUpdate(
-  update: (current: ClientSettings) => ClientSettings,
+async function persistPreparedClientSettingsUpdate<T>(
+  prepare: (current: ClientSettings) => {
+    readonly settings: ClientSettings;
+    readonly value: T;
+    readonly isCurrent: () => boolean;
+  } | null,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
-): Promise<ClientSettings> {
+): Promise<{
+  readonly previousSettings: ClientSettings;
+  readonly settings: ClientSettings;
+  readonly value: T;
+} | null> {
   return enqueueClientSettingsPersistence(async () => {
     if (clientSettingsHydrationStatus !== "ready") {
       await hydrateClientSettings();
     }
+    let hasUnpublishedWrite = false;
     for (;;) {
       const current = getClientSettingsSnapshot();
-      const next = update(current);
-      await persist(next);
+      const prepared = prepare(current);
+      if (prepared === null || !prepared.isCurrent()) {
+        if (hasUnpublishedWrite) await persist(current);
+        return null;
+      }
+      await persist(prepared.settings);
+      hasUnpublishedWrite = true;
+      if (!prepared.isCurrent()) {
+        await persist(getClientSettingsSnapshot());
+        return null;
+      }
       if (getClientSettingsSnapshot() === current) {
-        replaceClientSettingsSnapshot(next);
-        return next;
+        replaceClientSettingsSnapshot(prepared.settings);
+        return {
+          previousSettings: current,
+          settings: prepared.settings,
+          value: prepared.value,
+        };
       }
     }
   });
+}
+
+export async function persistClientSettingsUpdate(
+  update: (current: ClientSettings) => ClientSettings,
+  persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
+): Promise<ClientSettings> {
+  const result = await persistPreparedClientSettingsUpdate(
+    (current) => ({ settings: update(current), value: undefined, isCurrent: () => true }),
+    persist,
+  );
+  return result!.settings;
+}
+
+/**
+ * Persist an update only while the state it was derived from remains current.
+ * If the guard changes during the write, restore the live snapshot before returning null.
+ */
+export function persistGuardedClientSettingsUpdate<T>(
+  prepare: (current: ClientSettings) => {
+    readonly settings: ClientSettings;
+    readonly value: T;
+    readonly isCurrent: () => boolean;
+  } | null,
+  persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
+) {
+  return persistPreparedClientSettingsUpdate(prepare, persist);
 }
 
 // ── Key sets for routing patches ─────────────────────────────────────

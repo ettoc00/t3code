@@ -21,6 +21,12 @@ export interface ProjectFolderPreferenceHandoff<TPrevious> {
   readonly signal: AbortSignal;
 }
 
+export function isProjectFolderPreferenceHandoffCurrent(
+  handoff: ProjectFolderPreferenceHandoff<unknown>,
+): boolean {
+  return !handoff.signal.aborted && pendingPreferenceHandoffs.get(handoff.key)?.id === handoff.id;
+}
+
 /** Replace a delayed handoff while retaining the last project whose preferences were migrated. */
 export function beginProjectFolderPreferenceHandoff<TPrevious>(
   ref: { environmentId: EnvironmentId; projectId: ProjectId },
@@ -42,16 +48,14 @@ export function beginProjectFolderPreferenceHandoff<TPrevious>(
 }
 
 /** Apply only the newest delayed handoff for a checkout. */
-export async function applyProjectFolderPreferenceHandoff<TPrevious, TProject>(
+export async function applyProjectFolderPreferenceHandoff<TPrevious>(
   handoff: ProjectFolderPreferenceHandoff<TPrevious>,
-  project: TProject,
-  apply: (previous: TPrevious, project: TProject) => Promise<void>,
+  apply: (previous: TPrevious) => Promise<boolean>,
 ): Promise<boolean> {
-  if (pendingPreferenceHandoffs.get(handoff.key)?.id !== handoff.id) return false;
-  await apply(handoff.previous, project);
-  if (pendingPreferenceHandoffs.get(handoff.key)?.id === handoff.id) {
-    pendingPreferenceHandoffs.delete(handoff.key);
-  }
+  if (!isProjectFolderPreferenceHandoffCurrent(handoff)) return false;
+  if (!(await apply(handoff.previous))) return false;
+  if (!isProjectFolderPreferenceHandoffCurrent(handoff)) return false;
+  pendingPreferenceHandoffs.delete(handoff.key);
   return true;
 }
 

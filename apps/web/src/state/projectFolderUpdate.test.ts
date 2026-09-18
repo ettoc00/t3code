@@ -223,13 +223,10 @@ describe("project folder updates", () => {
       signal: firstHandoff.signal,
     }).then(() =>
       serializeProjectFolderUpdate(ref, () =>
-        applyProjectFolderPreferenceHandoff(
-          firstHandoff,
-          "/intermediate",
-          async (previous, path) => {
-            applied.push({ previous, project: path });
-          },
-        ),
+        applyProjectFolderPreferenceHandoff(firstHandoff, async (previous) => {
+          applied.push({ previous, project: "/intermediate" });
+          return true;
+        }),
       ),
     );
     const secondHandoff = beginProjectFolderPreferenceHandoff(ref, "/intermediate");
@@ -240,8 +237,9 @@ describe("project folder updates", () => {
       signal: secondHandoff.signal,
     }).then(() =>
       serializeProjectFolderUpdate(ref, () =>
-        applyProjectFolderPreferenceHandoff(secondHandoff, "/final", async (previous, path) => {
-          applied.push({ previous, project: path });
+        applyProjectFolderPreferenceHandoff(secondHandoff, async (previous) => {
+          applied.push({ previous, project: "/final" });
+          return true;
         }),
       ),
     );
@@ -252,5 +250,65 @@ describe("project folder updates", () => {
     await publish([snapshot(30, "/final")]);
     await secondEventual;
     expect(applied).toEqual([{ previous: "/old", project: "/final" }]);
+  });
+
+  it("supersedes a delayed relink when the delivered folder is selected again", async () => {
+    await publish([snapshot(1, "/old")]);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const foreground = waitForProject(ref, { workspaceRoot: "/intermediate", timeoutMs: 10 });
+    const foregroundFailure = expect(foreground).rejects.toThrow("project did not appear");
+    await vi.advanceTimersByTimeAsync(10);
+    await foregroundFailure;
+
+    const applied: Array<{ previous: string; project: string }> = [];
+    const delayed = beginProjectFolderPreferenceHandoff(ref, "/old");
+    const delayedWait = waitForProject(ref, {
+      workspaceRoot: "/intermediate",
+      timeoutMs: null,
+      signal: delayed.signal,
+    });
+
+    const restored = beginProjectFolderPreferenceHandoff(ref, "/old");
+    await expect(delayedWait).rejects.toThrow("project wait was cancelled");
+    const current = await waitForProject(ref, {
+      workspaceRoot: "/old",
+      signal: restored.signal,
+    });
+    await applyProjectFolderPreferenceHandoff(restored, async (previous) => {
+      applied.push({ previous, project: current.workspaceRoot });
+      return true;
+    });
+
+    await publish([snapshot(20, "/intermediate")]);
+    expect(applied).toEqual([{ previous: "/old", project: "/old" }]);
+  });
+
+  it("does not complete an async handoff after it is superseded", async () => {
+    await publish([snapshot(1, "/old")]);
+    let finishApply!: () => void;
+    let markApplyStarted!: () => void;
+    const applyStarted = new Promise<void>((resolve) => {
+      markApplyStarted = resolve;
+    });
+    const blockedApply = new Promise<void>((resolve) => {
+      finishApply = resolve;
+    });
+    const first = beginProjectFolderPreferenceHandoff(ref, "/old");
+    const firstApply = applyProjectFolderPreferenceHandoff(first, async () => {
+      markApplyStarted();
+      await blockedApply;
+      return true;
+    });
+    await applyStarted;
+
+    const second = beginProjectFolderPreferenceHandoff(ref, "/intermediate");
+    finishApply();
+    await expect(firstApply).resolves.toBe(false);
+    await expect(
+      applyProjectFolderPreferenceHandoff(second, async (previous) => {
+        expect(previous).toBe("/old");
+        return true;
+      }),
+    ).resolves.toBe(true);
   });
 });

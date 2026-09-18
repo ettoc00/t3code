@@ -28,6 +28,7 @@ import {
   getClientSettings,
   mergeEnvironmentSettings,
   persistClientSettingsPatch,
+  persistGuardedClientSettingsUpdate,
   persistClientSettingsUpdate,
   resolveEnvironmentIdentificationMode,
 } from "./useSettings";
@@ -233,6 +234,74 @@ describe("persistClientSettingsUpdate", () => {
     expect(getClientSettings()).toBe(DEFAULT_CLIENT_SETTINGS);
   });
 
+  it("publishes guarded state only after a failed write is retried successfully", async () => {
+    const failure = new Error("disk full");
+    const persist = vi.fn().mockRejectedValueOnce(failure).mockResolvedValue(undefined);
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    let publishedUi = "old";
+    const apply = async () => {
+      const result = await persistGuardedClientSettingsUpdate(
+        (current) => ({
+          settings: { ...current, timestampFormat: "12-hour" },
+          value: "new",
+          isCurrent: () => true,
+        }),
+        persist,
+      );
+      if (result) publishedUi = result.value;
+    };
+
+    await expect(apply()).rejects.toBe(failure);
+    expect(getClientSettings()).toBe(DEFAULT_CLIENT_SETTINGS);
+    expect(publishedUi).toBe("old");
+
+    await expect(apply()).resolves.toBeUndefined();
+    expect(getClientSettings().timestampFormat).toBe("12-hour");
+    expect(publishedUi).toBe("new");
+  });
+
+  it("rolls back a guarded write when its source changes during persistence", async () => {
+    let finishPersistence!: () => void;
+    let markPersistenceStarted!: () => void;
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const blockedPersistence = new Promise<void>((resolve) => {
+      finishPersistence = resolve;
+    });
+    let durableSettings = DEFAULT_CLIENT_SETTINGS;
+    const persist = vi
+      .fn<(settings: ClientSettings) => Promise<void>>()
+      .mockImplementationOnce(async (settings) => {
+        markPersistenceStarted();
+        await blockedPersistence;
+        durableSettings = settings;
+      })
+      .mockImplementation(async (settings) => {
+        durableSettings = settings;
+      });
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    let project = { workspaceRoot: "/selected" };
+
+    const pending = persistGuardedClientSettingsUpdate((current) => {
+      const sourceProject = project;
+      return {
+        settings: { ...current, timestampFormat: "12-hour" },
+        value: sourceProject,
+        isCurrent: () => project === sourceProject,
+      };
+    }, persist);
+    await persistenceStarted;
+    project = { workspaceRoot: "/elsewhere" };
+    finishPersistence();
+
+    await expect(pending).resolves.toBeNull();
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(persist.mock.calls[1]?.[0]).toBe(DEFAULT_CLIENT_SETTINGS);
+    expect(durableSettings).toBe(DEFAULT_CLIENT_SETTINGS);
+    expect(getClientSettings()).toBe(DEFAULT_CLIENT_SETTINGS);
+  });
+
   it("preserves an optimistic write made while an awaited update persists", async () => {
     let finishFirstPersistence!: () => void;
     let durableSettings = DEFAULT_CLIENT_SETTINGS;
@@ -380,17 +449,24 @@ describe("persistClientSettingsUpdate", () => {
       projectExpandedById: {},
       projectOrder: [oldA, oldB],
     };
-    const relink = (previous: EnvironmentProject, moved: EnvironmentProject) =>
-      persistClientSettingsUpdate((settings) => {
-        const next = relinkProjectPreferences(uiState, {
+    const relink = async (previous: EnvironmentProject, moved: EnvironmentProject) => {
+      const persisted = await persistGuardedClientSettingsUpdate((settings) => {
+        const nextSettings = relinkProjectPreferences(uiState, {
           previous,
           project: moved,
           projects: [movedA, movedB],
           settings,
         });
-        uiState = next.uiState;
-        return next.settings;
+        return { settings: nextSettings.settings, value: undefined, isCurrent: () => true };
       });
+      const next = relinkProjectPreferences(uiState, {
+        previous,
+        project: moved,
+        projects: [movedA, movedB],
+        settings: persisted!.previousSettings,
+      });
+      uiState = next.uiState;
+    };
 
     const first = relink(previousA, movedA);
     const second = relink(previousB, movedB);
