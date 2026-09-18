@@ -8,7 +8,11 @@ import {
   type ServerProviderModel,
 } from "@t3tools/contracts";
 
-import { deriveProviderModelsForDisplay, ProviderInstanceCard } from "./ProviderInstanceCard";
+import {
+  deriveProviderModelsForDisplay,
+  getProviderUpdateActionLabel,
+  ProviderInstanceCard,
+} from "./ProviderInstanceCard";
 
 describe("deriveProviderModelsForDisplay", () => {
   it("uses current config custom models instead of stale live custom rows", () => {
@@ -121,6 +125,24 @@ describe("deriveProviderModelsForDisplay", () => {
     expect(markup).toContain("blur-[2px]");
     expect(markup).not.toContain("developer@example.com");
   });
+
+  it("describes an unknown-version action as checking while it runs", () => {
+    expect(
+      getProviderUpdateActionLabel({
+        isCheck: true,
+        isUpdating: true,
+        title: "Check for updates",
+      }),
+    ).toBe("Checking for updates");
+    expect(
+      getProviderUpdateActionLabel({
+        isCheck: false,
+        isUpdating: true,
+        title: "Update available",
+      }),
+    ).toBe("Updating");
+  });
+
   it("surfaces a failed probe message in both the list row and the editor", () => {
     const instanceId = ProviderInstanceId.make("codex_work");
     const driver = ProviderDriverKind.make("codex");

@@ -384,6 +384,15 @@ interface ProviderInstanceCardProps {
   readonly isUpdating?: boolean | undefined;
 }
 
+export function getProviderUpdateActionLabel(input: {
+  readonly isCheck: boolean;
+  readonly isUpdating: boolean;
+  readonly title: string;
+}) {
+  if (input.isUpdating) return input.isCheck ? "Checking for updates" : "Updating";
+  return input.isCheck ? input.title : "Update now";
+}
+
 /**
  * Renders one provider instance as either a compact selectable list row or
  * the full editor shown beside that list. Both modes use the same enabled
@@ -752,11 +761,11 @@ export function ProviderInstanceCard({
                     onClick={onRunUpdate}
                   >
                     {isUpdating ? <Spinner /> : <DownloadIcon />}
-                    {isUpdating
-                      ? "Updating"
-                      : versionAdvisory.isCheck
-                        ? versionAdvisory.title
-                        : "Update now"}
+                    {getProviderUpdateActionLabel({
+                      isCheck: versionAdvisory.isCheck,
+                      isUpdating,
+                      title: versionAdvisory.title,
+                    })}
                   </Button>
                 ) : null}
                 {onRunUpdate && updateCommand ? (
