@@ -107,11 +107,12 @@ function writeWindowsNpmShim(shim: string, packageName: string, binPath = "bin/p
     JSON.stringify({ name: packageName, bin: { [commandName]: binPath } }),
   );
   const target = NodePath.join("node_modules", ...packageName.split("/"), binPath);
+  const portableTarget = target.replaceAll("\\", "/");
   const contents = /\.cmd$/i.test(shim)
-    ? `@ECHO off\r\nSET dp0=%~dp0\r\n"%dp0%\\node.exe" "%dp0%\\${target}" %*\r\n`
+    ? `@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*\r\n`
     : /\.ps1$/i.test(shim)
-      ? `#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n& "$basedir/node.exe" "$basedir/${target}" $args\n`
-      : `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/node" "$basedir/${target}" "$@"\n`;
+      ? `#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n\n$exe=""\nif ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {\n  # Fix case when both the Windows and Linux builds of Node\n  # are installed in the same directory\n  $exe=".exe"\n}\n$ret=0\nif (Test-Path "$basedir/node$exe") {\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {\n    $input | & "$basedir/node$exe"  "$basedir/${portableTarget}" $args\n  } else {\n    & "$basedir/node$exe"  "$basedir/${portableTarget}" $args\n  }\n  $ret=$LASTEXITCODE\n} else {\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {\n    $input | & "node$exe"  "$basedir/${portableTarget}" $args\n  } else {\n    & "node$exe"  "$basedir/${portableTarget}" $args\n  }\n  $ret=$LASTEXITCODE\n}\nexit $ret\n`
+      : `#!/bin/sh\nbasedir=$(dirname "$(echo "$0" | sed -e 's,\\\\,/,g')")\n\ncase \`uname\` in\n    *CYGWIN*|*MINGW*|*MSYS*)\n        if command -v cygpath > /dev/null 2>&1; then\n            basedir=\`cygpath -w "$basedir"\`\n        fi\n    ;;\nesac\n\nif [ -x "$basedir/node" ]; then\n  exec "$basedir/node"  "$basedir/${portableTarget}" "$@"\nelse\u0020\n  exec node  "$basedir/${portableTarget}" "$@"\nfi\n`;
   NodeFS.writeFileSync(shim, contents);
 }
 
@@ -1095,41 +1096,80 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       );
       expect(unrelatedShim.update).toBeNull();
 
-      for (const [filename, comment] of [
-        ["package-tool.cmd", "REM"],
-        ["package-tool.ps1", "#"],
-        ["package-tool.sh", "#"],
-      ] as const) {
+      for (const filename of ["package-tool.cmd", "package-tool.ps1", "package-tool"] as const) {
         const wrapper = NodePath.join(tempDir, filename);
-        for (const candidate of ["package-tool.sh", "package-tool.cmd", "package-tool.ps1"]) {
+        for (const candidate of ["package-tool", "package-tool.cmd", "package-tool.ps1"]) {
           NodeFS.rmSync(NodePath.join(tempDir, candidate), { force: true });
         }
         writeWindowsNpmShim(wrapper, "@example/package-tool");
-        const owned = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
-          binaryPath: wrapper,
-          env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1;.SH" },
-        }).pipe(
-          Effect.provideService(HostProcessPlatform, "win32"),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
-        );
+        const resolveWrapper = () =>
+          (filename === "package-tool"
+            ? packageToolUpdate.resolve({
+                binaryPath: wrapper,
+                resolvedCommandPath: wrapper,
+                realCommandPath: wrapper,
+                env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1" },
+                platform: "win32",
+              })
+            : resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+                binaryPath: wrapper,
+                env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1" },
+              })
+          ).pipe(
+            Effect.provideService(HostProcessPlatform, "win32"),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+          );
+        const owned = yield* resolveWrapper();
         expect(owned.update, filename).not.toBeNull();
 
-        const target = "node_modules/@example/package-tool/bin/package-tool.js";
-        const decoy =
-          filename === "package-tool.cmd"
-            ? `${comment} "%_prog%" "%dp0%/${target}" %*\r\n`
-            : filename === "package-tool.ps1"
-              ? `<#\n& "$basedir/node.exe" "$basedir/${target}" $args\n#>\n${comment} decoy\n`
-              : `#!/bin/sh\n${comment} exec "$basedir/node" "$basedir/${target}" "$@"\n`;
-        NodeFS.writeFileSync(wrapper, decoy);
-        const commentOnly = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
-          binaryPath: wrapper,
-          env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1;.SH" },
-        }).pipe(
-          Effect.provideService(HostProcessPlatform, "win32"),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+        const target = NodePath.join(
+          "node_modules",
+          "@example",
+          "package-tool",
+          "bin",
+          "package-tool.js",
         );
-        expect(commentOnly.update).toBeNull();
+        const wrapperTarget =
+          filename === "package-tool.cmd" ? target : target.replaceAll("\\", "/");
+        const canonical = NodeFS.readFileSync(wrapper, "utf8");
+        const invocation =
+          filename === "package-tool.cmd"
+            ? `"%_prog%"  "%dp0%\\${target}" %*`
+            : filename === "package-tool.ps1"
+              ? `& "$basedir/node$exe"  "$basedir/${wrapperTarget}" $args`
+              : `exec "$basedir/node"  "$basedir/${wrapperTarget}" "$@"`;
+        const attacks =
+          filename === "package-tool.cmd"
+            ? [
+                `@ECHO off\r\nIF 1==0 ${invocation}\r\n`,
+                `@ECHO off\r\nGOTO safe\r\n:skipped\r\n${invocation}\r\n:safe\r\nEXIT /b 0\r\n`,
+                `@ECHO off\r\nnode evil.js "%dp0%\\${target}" %*\r\n`,
+                `@ECHO off\r\nREM ${invocation}\r\n`,
+              ]
+            : filename === "package-tool.ps1"
+              ? [
+                  `if ($false) { ${invocation} }\n`,
+                  `& "$basedir/node$exe" "evil.js" "$basedir/${wrapperTarget}" $args\n`,
+                  `<#\n${invocation}\n#>\n`,
+                  `# ${invocation}\n`,
+                ]
+              : [
+                  `#!/bin/sh\nif false; then ${invocation}; fi\n`,
+                  `#!/bin/sh\nexec node evil.js "$basedir/${wrapperTarget}" "$@"\n`,
+                  `#!/bin/sh\n# ${invocation}\n`,
+                ];
+        attacks.push(
+          canonical.replaceAll(
+            wrapperTarget,
+            filename === "package-tool.cmd"
+              ? NodePath.join("node_modules", "evil", "evil.js")
+              : "node_modules/evil/evil.js",
+          ),
+        );
+        for (const attack of attacks) {
+          NodeFS.writeFileSync(wrapper, attack);
+          expect((yield* resolveWrapper()).update, `${filename}: ${attack}`).toBeNull();
+        }
       }
 
       // The same layout on POSIX is a project checkout, not a global install.

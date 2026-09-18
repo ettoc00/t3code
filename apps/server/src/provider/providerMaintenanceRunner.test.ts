@@ -1174,6 +1174,59 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
+  it.effect("re-resolves ownership after refresh changes the selected executable", () => {
+    const capabilityPaths: string[] = [];
+    let selectedExecutable = "C:/Scoop/apps/codex/current/codex.exe";
+    let refreshes = 0;
+    return Effect.gen(function* () {
+      const { registry, providersRef } = yield* makeRegistry(baseProvider);
+      const capabilities = (executable: string) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: "C:/Scoop/shims/scoop.cmd",
+          updateArgs: ["update", "main/codex"],
+          updateLockKey: "scoop:c:/scoop",
+          updateInstallationKey: `scoop:c:/scoop:main:codex:${executable.toLowerCase()}`,
+          env: { SCOOP: "C:/Scoop", T3_SELECTED_EXECUTABLE: executable },
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        refreshInstance: () => {
+          refreshes += 1;
+          if (refreshes === 1) return Ref.get(providersRef);
+          selectedExecutable = "D:/Portable/codex/codex.exe";
+          return Ref.updateAndGet(providersRef, (providers) =>
+            providers.map((provider) => ({ ...provider, version: "0.0.1" })),
+          );
+        },
+        getProviderMaintenanceCapabilitiesForInstance: () =>
+          Effect.sync(() => {
+            capabilityPaths.push(selectedExecutable);
+            return capabilities(selectedExecutable);
+          }),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(capabilityPaths, [
+        "C:/Scoop/apps/codex/current/codex.exe",
+        "C:/Scoop/apps/codex/current/codex.exe",
+        "D:/Portable/codex/codex.exe",
+      ]);
+      assert.strictEqual(result.providers[0]?.version, "0.0.1");
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
+      assert.match(result.providers[0]?.updateState?.message ?? "", /installation changed/i);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer(() => ({ stdout: "updated" })),
+        ),
+      ),
+    );
+  });
+
   it.effect("uses the resolved provider capabilities when choosing the update executable", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     return Effect.gen(function* () {

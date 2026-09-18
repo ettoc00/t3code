@@ -905,6 +905,83 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
  * proof. On Windows, both the package's declared bin entry and an npm-shaped
  * shim targeting that entry must match the selected command.
  */
+function isCanonicalWindowsNpmShim(
+  shimKind: "cmd" | "powershell" | "shell",
+  shimText: string,
+  expectedTarget: string,
+): boolean {
+  // Match cmd-shim's generated bodies as a unit. Accepting an invocation line
+  // in isolation cannot prove that control flow actually reaches that line.
+  const target = expectedTarget.replaceAll("\\", "/");
+  const cmdTarget = target.replaceAll("/", "\\");
+  const normalized = shimText.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trimEnd();
+  const expected =
+    shimKind === "cmd"
+      ? `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${cmdTarget}" %*`
+      : shimKind === "powershell"
+        ? `#!/usr/bin/env pwsh
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
+
+$exe=""
+if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
+  # Fix case when both the Windows and Linux builds of Node
+  # are installed in the same directory
+  $exe=".exe"
+}
+$ret=0
+if (Test-Path "$basedir/node$exe") {
+  # Support pipeline input
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "$basedir/node$exe"  "$basedir/${target}" $args
+  } else {
+    & "$basedir/node$exe"  "$basedir/${target}" $args
+  }
+  $ret=$LASTEXITCODE
+} else {
+  # Support pipeline input
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "node$exe"  "$basedir/${target}" $args
+  } else {
+    & "node$exe"  "$basedir/${target}" $args
+  }
+  $ret=$LASTEXITCODE
+}
+exit $ret`
+        : `#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\\\,/,g')")
+
+case \`uname\` in
+    *CYGWIN*|*MINGW*|*MSYS*)
+        if command -v cygpath > /dev/null 2>&1; then
+            basedir=\`cygpath -w "$basedir"\`
+        fi
+    ;;
+esac
+
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/${target}" "$@"
+else\u0020
+  exec node  "$basedir/${target}" "$@"
+fi`;
+  return normalized === expected;
+}
+
 const resolveNpmGlobalPrefix = Effect.fn("resolveNpmGlobalPrefix")(function* (
   context: ProviderMaintenanceResolutionContext,
   packageName: string,
@@ -954,48 +1031,7 @@ const resolveNpmGlobalPrefix = Effect.fn("resolveNpmGlobalPrefix")(function* (
   const expectedTarget = ["node_modules", ...packageSegments, normalizedBinPath]
     .join("/")
     .toLowerCase();
-  const lines = shimText
-    .replaceAll("\\", "/")
-    .split(/\r?\n/)
-    .map((line) => line.trim());
-  let inPowerShellBlockComment = false;
-  const invokesDeclaredBin = lines.some((line) => {
-    if (shimKind === "powershell") {
-      if (inPowerShellBlockComment) {
-        if (line.includes("#>")) inPowerShellBlockComment = false;
-        return false;
-      }
-      if (line.startsWith("<#")) {
-        if (!line.includes("#>")) inPowerShellBlockComment = true;
-        return false;
-      }
-    }
-    const normalized = line.toLowerCase();
-    const targetIndex = normalized.indexOf(expectedTarget);
-    if (targetIndex < 0) return false;
-    if (shimKind === "cmd") {
-      if (/^(?:::|@?rem\b|@?echo\b)/i.test(line)) return false;
-      const argumentsIndex = normalized.indexOf("%*", targetIndex + expectedTarget.length);
-      const command = normalized.slice(0, targetIndex);
-      return (
-        argumentsIndex >= 0 &&
-        (/%_prog%/.test(command) || /(?:^|[&|]\s*)[^&|]*\bnode(?:\.exe)?["']?\s/.test(command))
-      );
-    }
-    if (shimKind === "powershell") {
-      if (line.startsWith("#")) return false;
-      return (
-        normalized.startsWith("&") &&
-        normalized.indexOf("$args", targetIndex + expectedTarget.length) >= 0
-      );
-    }
-    if (line.startsWith("#")) return false;
-    return (
-      normalized.startsWith("exec ") &&
-      normalized.indexOf('"$@"', targetIndex + expectedTarget.length) >= 0
-    );
-  });
-  return invokesDeclaredBin ? shimDir : null;
+  return isCanonicalWindowsNpmShim(shimKind, shimText, expectedTarget) ? shimDir : null;
 });
 
 export function makePackageManagedProviderMaintenanceResolver(

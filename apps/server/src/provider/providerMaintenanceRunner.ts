@@ -74,6 +74,7 @@ class ProviderMaintenanceCommandError extends Data.TaggedError("ProviderMaintena
 interface VerifiedProviderRefresh {
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly verifiedProviders: ReadonlyArray<ServerProvider>;
+  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
 }
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -304,7 +305,6 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
 
   const verifyRefreshedProvider = (
     provider: ProviderDriverKind,
-    maintenanceCapabilities: ProviderMaintenanceCapabilities,
     instanceId: ProviderInstanceId,
   ): Effect.Effect<VerifiedProviderRefresh> =>
     providerRegistry.getProviders.pipe(
@@ -333,42 +333,51 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
         const refreshedProviders = providers.filter(
           (candidate) => candidate.driver === provider && candidate.instanceId === instanceId,
         );
-        if (refreshedProviders.length === 0) {
-          return Effect.succeed<VerifiedProviderRefresh>({
-            providers,
-            verifiedProviders: [],
-          });
-        }
-        return Effect.forEach(
-          refreshedProviders,
-          (refreshedProvider) =>
-            enrichProviderSnapshotWithVersionAdvisory(
-              refreshedProvider,
-              maintenanceCapabilities,
-            ).pipe(
-              Effect.provideService(HttpClient.HttpClient, httpClient),
-              Effect.provideService(ProviderVersionCache, versionCache),
-            ),
-          {
-            concurrency: "unbounded",
-          },
-        ).pipe(
-          Effect.map((verifiedProviders): VerifiedProviderRefresh => ({
-            providers,
-            verifiedProviders,
-          })),
-          Effect.catchCause((cause) =>
-            Effect.logWarning("Provider post-update version verification failed", {
-              provider,
-              cause: Cause.pretty(cause),
-            }).pipe(
-              Effect.as<VerifiedProviderRefresh>({
-                providers,
-                verifiedProviders: refreshedProviders,
-              }),
-            ),
-          ),
-        );
+        return providerRegistry
+          .getProviderMaintenanceCapabilitiesForInstance(instanceId, provider, { fresh: true })
+          .pipe(
+            Effect.flatMap((maintenanceCapabilities) => {
+              if (refreshedProviders.length === 0) {
+                return Effect.succeed<VerifiedProviderRefresh>({
+                  providers,
+                  verifiedProviders: [],
+                  maintenanceCapabilities,
+                });
+              }
+              return Effect.forEach(
+                refreshedProviders,
+                (refreshedProvider) =>
+                  enrichProviderSnapshotWithVersionAdvisory(
+                    refreshedProvider,
+                    maintenanceCapabilities,
+                  ).pipe(
+                    Effect.provideService(HttpClient.HttpClient, httpClient),
+                    Effect.provideService(ProviderVersionCache, versionCache),
+                  ),
+                {
+                  concurrency: "unbounded",
+                },
+              ).pipe(
+                Effect.map((verifiedProviders): VerifiedProviderRefresh => ({
+                  providers,
+                  verifiedProviders,
+                  maintenanceCapabilities,
+                })),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Provider post-update version verification failed", {
+                    provider,
+                    cause: Cause.pretty(cause),
+                  }).pipe(
+                    Effect.as<VerifiedProviderRefresh>({
+                      providers,
+                      verifiedProviders: refreshedProviders,
+                      maintenanceCapabilities,
+                    }),
+                  ),
+                ),
+              );
+            }),
+          );
       }),
     );
 
@@ -604,17 +613,11 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               );
             }
 
-            // Homebrew's "latest" moves once the upgrade lands; read it again.
-            const verified = yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
-              instanceId,
-              provider,
-              { fresh: true },
-            );
-            const { verifiedProviders } = yield* verifyRefreshedProvider(
-              provider,
-              verified,
-              instanceId,
-            );
+            // Refresh the selected executable before re-resolving ownership.
+            // A refresh can discover a different path/shim, whose version must
+            // never be used as evidence that the selected installation updated.
+            const { verifiedProviders, maintenanceCapabilities: verified } =
+              yield* verifyRefreshedProvider(provider, instanceId);
             const installationChanged = !isSameMaintenanceAction(executionUpdate, verified.update);
             // "Succeeded" needs the provider to still be installed: an
             // installer that exits 0 and leaves the binary missing is not a
