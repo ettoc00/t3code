@@ -947,12 +947,6 @@ const resolveNpmGlobalPrefix = Effect.fn("resolveNpmGlobalPrefix")(function* (
   if (!binPath || path.isAbsolute(binPath) || binPath.split(/[\\/]/).includes("..")) return null;
   const shimText = yield* read(context.resolvedCommandPath);
   if (!shimText) return null;
-  const recognizedShim =
-    shimKind === "cmd"
-      ? /%(?:~)?dp0%?/i.test(shimText) && /%\*/.test(shimText)
-      : shimKind === "powershell"
-        ? /\$basedir/i.test(shimText) && /\$args/i.test(shimText)
-        : /^#!.*\bsh\b/m.test(shimText) && /\bbasedir=/i.test(shimText) && /"\$@"/.test(shimText);
   const normalizedBinPath = binPath
     .split(/[\\/]/)
     .filter((segment) => segment !== "." && segment !== "")
@@ -960,9 +954,48 @@ const resolveNpmGlobalPrefix = Effect.fn("resolveNpmGlobalPrefix")(function* (
   const expectedTarget = ["node_modules", ...packageSegments, normalizedBinPath]
     .join("/")
     .toLowerCase();
-  return recognizedShim && shimText.replaceAll("\\", "/").toLowerCase().includes(expectedTarget)
-    ? shimDir
-    : null;
+  const lines = shimText
+    .replaceAll("\\", "/")
+    .split(/\r?\n/)
+    .map((line) => line.trim());
+  let inPowerShellBlockComment = false;
+  const invokesDeclaredBin = lines.some((line) => {
+    if (shimKind === "powershell") {
+      if (inPowerShellBlockComment) {
+        if (line.includes("#>")) inPowerShellBlockComment = false;
+        return false;
+      }
+      if (line.startsWith("<#")) {
+        if (!line.includes("#>")) inPowerShellBlockComment = true;
+        return false;
+      }
+    }
+    const normalized = line.toLowerCase();
+    const targetIndex = normalized.indexOf(expectedTarget);
+    if (targetIndex < 0) return false;
+    if (shimKind === "cmd") {
+      if (/^(?:::|@?rem\b|@?echo\b)/i.test(line)) return false;
+      const argumentsIndex = normalized.indexOf("%*", targetIndex + expectedTarget.length);
+      const command = normalized.slice(0, targetIndex);
+      return (
+        argumentsIndex >= 0 &&
+        (/%_prog%/.test(command) || /(?:^|[&|]\s*)[^&|]*\bnode(?:\.exe)?["']?\s/.test(command))
+      );
+    }
+    if (shimKind === "powershell") {
+      if (line.startsWith("#")) return false;
+      return (
+        normalized.startsWith("&") &&
+        normalized.indexOf("$args", targetIndex + expectedTarget.length) >= 0
+      );
+    }
+    if (line.startsWith("#")) return false;
+    return (
+      normalized.startsWith("exec ") &&
+      normalized.indexOf('"$@"', targetIndex + expectedTarget.length) >= 0
+    );
+  });
+  return invokesDeclaredBin ? shimDir : null;
 });
 
 export function makePackageManagedProviderMaintenanceResolver(

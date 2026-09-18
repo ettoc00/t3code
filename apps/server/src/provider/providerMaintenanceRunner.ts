@@ -85,6 +85,7 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
     readonly args: ReadonlyArray<string>;
     readonly env?: NodeJS.ProcessEnv;
     readonly cancel?: Effect.Effect<boolean>;
+    readonly afterSpawn?: (launcherExited: Effect.Effect<void>) => Effect.Effect<void>;
   }) {
     const collectCommandResult = Effect.fn("ProviderMaintenanceRunner.collectCommandResult")(
       function* () {
@@ -126,6 +127,9 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
             yield* child.kill().pipe(Effect.ignore);
           }),
         );
+        if (input.afterSpawn) {
+          yield* input.afterSpawn(child.exitCode.pipe(Effect.asVoid, Effect.orDie));
+        }
 
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
@@ -504,19 +508,10 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             }
             let result: ProviderMaintenanceCommandResult =
               yield* runMaintenanceCommand(executionUpdate);
+            let elevationOwnershipChanged = false;
             const needsElevation =
               platform === "win32" && requiresWindowsAdministrator(executionUpdate, result);
             if (needsElevation) {
-              const elevatedCapabilities =
-                yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
-                  instanceId,
-                  provider,
-                  { fresh: true },
-                );
-              const elevatedUpdate = elevatedCapabilities.update;
-              if (!elevatedUpdate || !isSameMaintenanceAction(executionUpdate, elevatedUpdate)) {
-                return yield* finishInstallationChanged(commandOutput(result));
-              }
               yield* setUpdateState(
                 makeUpdateState({
                   status: "running",
@@ -527,13 +522,42 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               );
               result = yield* Effect.gen(function* () {
                 const elevated = yield* prepareWindowsUpdateElevation(
-                  elevatedUpdate,
+                  executionUpdate,
                   UPDATE_TIMEOUT_MS,
                   UPDATE_OUTPUT_MAX_BYTES,
                 );
                 const result = yield* runProviderMaintenanceCommandWithSpawner({
                   spawner,
                   ...elevated,
+                  afterSpawn: (launcherExited) =>
+                    Effect.race(
+                      elevated.waitUntilReady.pipe(Effect.as("ready" as const)),
+                      launcherExited.pipe(Effect.as("exited" as const)),
+                    ).pipe(
+                      Effect.flatMap((state) =>
+                        state === "ready" ? Effect.succeed(true) : elevated.isReady,
+                      ),
+                      Effect.flatMap((ready) => {
+                        if (!ready) return Effect.void;
+                        return Effect.gen(function* () {
+                          const approvedCapabilities =
+                            yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
+                              instanceId,
+                              provider,
+                              { fresh: true },
+                            );
+                          if (
+                            !approvedCapabilities.update ||
+                            !isSameMaintenanceAction(executionUpdate, approvedCapabilities.update)
+                          ) {
+                            elevationOwnershipChanged = true;
+                            yield* elevated.cancel;
+                            return;
+                          }
+                          yield* elevated.authorize;
+                        });
+                      }),
+                    ),
                 });
                 const [stdout, stderr] = yield* elevated.readOutput;
                 return {
@@ -550,13 +574,18 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                 Effect.scoped,
               );
             }
+            if (elevationOwnershipChanged) {
+              return yield* finishInstallationChanged(commandOutput(result));
+            }
             // WinGet reports "no applicable update" as a nonzero exit. Still
             // verify the selected provider instead of presenting this as failure.
+            let noApplicableUpdate = false;
             if (
               executionUpdate.windowsInstaller?.manager === "winget" &&
               result.exitCode !== null &&
               result.exitCode >>> 0 === 0x8a15002b
             ) {
+              noApplicableUpdate = true;
               result = { ...result, exitCode: 0 };
             }
             const finishedAt = yield* nowIso;
@@ -599,20 +628,19 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             );
             const versionAdvanced = verifiedProviders.some(
               (verifiedProvider) =>
+                versionBeforeUpdate &&
                 verifiedProvider.version?.trim() &&
-                (!versionBeforeUpdate ||
-                  compareSemverVersions(versionBeforeUpdate, verifiedProvider.version) < 0),
+                compareSemverVersions(versionBeforeUpdate, verifiedProvider.version) < 0,
             );
-            // Cursor can be healthy without a readable version. That unknown
-            // baseline remains compatible, but a known version must advance
-            // just like every other provider before the update is successful.
-            const versionUnchanged = versionBeforeUpdate
-              ? !versionAdvanced
-              : provider !== "cursor" && !versionAdvanced;
+            const versionUnchanged = !versionAdvanced;
             return yield* finish(
               makeUpdateState({
                 status:
-                  installationChanged || couldNotVerify || stillOutdated || versionUnchanged
+                  installationChanged ||
+                  couldNotVerify ||
+                  stillOutdated ||
+                  noApplicableUpdate ||
+                  versionUnchanged
                     ? "unchanged"
                     : "succeeded",
                 startedAt,
@@ -623,9 +651,11 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                     ? "Update command completed, but T3 Code could not verify the provider version."
                     : stillOutdated
                       ? "Update command completed, but T3 Code still detects an outdated provider version."
-                      : versionUnchanged
-                        ? "Update command completed, but the provider version did not advance."
-                        : "Provider updated.",
+                      : noApplicableUpdate
+                        ? "WinGet reported that no applicable update is available."
+                        : versionUnchanged
+                          ? "Update command completed, but the provider version did not advance."
+                          : "Provider updated.",
                 output: commandOutput(result),
               }),
             );

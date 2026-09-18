@@ -4,6 +4,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -73,7 +74,7 @@ for (const { mode, expectedCode } of [
             : launcher.replace("$start.Verb = 'runas'", "$start.Verb = ''");
         assert.notStrictEqual(testLauncher, launcher, "launcher patch did not apply");
         const encoded = Buffer.from(testLauncher, "utf16le").toString("base64");
-        const exitCode = yield* Effect.promise(
+        const exitFiber = yield* Effect.promise(
           () =>
             new Promise<number>((resolve, reject) => {
               NodeChildProcess.execFile(
@@ -86,7 +87,23 @@ for (const { mode, expectedCode } of [
                 },
               );
             }),
-        );
+        ).pipe(Effect.forkScoped);
+        if (!["cancel", "expired", "declined"].includes(mode)) {
+          const readiness = yield* Effect.race(
+            prepared.waitUntilReady.pipe(Effect.as({ ready: true as const })),
+            Fiber.join(exitFiber).pipe(
+              Effect.map((exitCode) => ({ ready: false as const, exitCode })),
+            ),
+          );
+          if (!readiness.ready) {
+            const [, earlyStderr] = yield* prepared.readOutput;
+            assert.fail(
+              `elevated worker exited ${readiness.exitCode} before becoming ready: ${earlyStderr?.text ?? ""}`,
+            );
+          }
+          yield* prepared.authorize;
+        }
+        const exitCode = yield* Fiber.join(exitFiber);
         const [stdout, stderr] = yield* prepared.readOutput;
         assert.strictEqual(exitCode, expectedCode, stderr?.text);
         if (mode.endsWith("complete")) {

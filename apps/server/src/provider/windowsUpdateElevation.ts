@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import type { ProviderMaintenanceCommandAction } from "./providerMaintenance.ts";
 import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
@@ -28,6 +29,8 @@ export const prepareWindowsUpdateElevation = Effect.fn("prepareWindowsUpdateElev
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-provider-update-" });
   const payloadPath = path.join(directory, "command.json");
   const cancelPath = path.join(directory, "cancel");
+  const readyPath = path.join(directory, "ready");
+  const authorizePath = path.join(directory, "authorize");
   const startedPath = path.join(directory, "started");
   const stdoutPath = path.join(directory, "stdout");
   const stderrPath = path.join(directory, "stderr");
@@ -71,11 +74,11 @@ export const prepareWindowsUpdateElevation = Effect.fn("prepareWindowsUpdateElev
   // the unelevated launcher cannot stop an administrator process.
   const worker = `
 $ErrorActionPreference = 'Stop'
-[IO.File]::WriteAllText(${quotePowerShell(startedPath)}, 'started')
 $parent = Get-Process -Id __T3_PARENT_PID__ -ErrorAction Stop
 $deadline = [DateTime]::Parse('__T3_DEADLINE__').ToUniversalTime()
 $payloadPath = ${quotePowerShell(payloadPath)}
 $cancelPath = ${quotePowerShell(cancelPath)}
+$authorizePath = ${quotePowerShell(authorizePath)}
 $child = $null
 try {
   if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne '__T3_USER_SID__') {
@@ -89,6 +92,12 @@ try {
     [Environment]::SetEnvironmentVariable($variable[0], $variable[1], 'Process')
   }
   if ((Test-Path -LiteralPath $cancelPath) -or [DateTime]::UtcNow -ge $deadline -or $parent.HasExited) { exit 1460 }
+  while (-not (Test-Path -LiteralPath $authorizePath)) {
+    if ((Test-Path -LiteralPath $cancelPath) -or [DateTime]::UtcNow -ge $deadline -or $parent.HasExited) { exit 1460 }
+    Start-Sleep -Milliseconds 25
+  }
+  if ((Test-Path -LiteralPath $cancelPath) -or [DateTime]::UtcNow -ge $deadline -or $parent.HasExited) { exit 1460 }
+  [IO.File]::WriteAllText(${quotePowerShell(startedPath)}, 'started')
   $child = Start-Process -FilePath $config.executable -ArgumentList $config.arguments -WindowStyle Hidden -RedirectStandardOutput $config.stdout -RedirectStandardError $config.stderr -PassThru
   $null = $child.Handle
   while (-not $child.WaitForExit(200)) {
@@ -120,6 +129,7 @@ try {
   $start.Verb = 'runas'
   $start.WindowStyle = 'Hidden'
   $child = [Diagnostics.Process]::Start($start)
+  [IO.File]::WriteAllText(${quotePowerShell(readyPath)}, 'ready')
   $child.WaitForExit()
   exit $child.ExitCode
 } catch {
@@ -132,12 +142,31 @@ try {
   exit 1
 }
 `;
+  const waitUntilReady = Effect.race(
+    fs.watch(directory).pipe(
+      Stream.filter((event) => path.basename(event.path) === "ready"),
+      Stream.runHead,
+      Effect.asVoid,
+    ),
+    Effect.yieldNow.pipe(
+      Effect.andThen(fs.exists(readyPath)),
+      Effect.flatMap((ready) => (ready ? Effect.void : Effect.never)),
+    ),
+  ).pipe(Effect.orDie);
   return {
     command: powershell,
     args: ["-NoProfile", "-NonInteractive", "-EncodedCommand", encodePowerShell(launcher)],
+    waitUntilReady,
+    isReady: fs.exists(readyPath).pipe(Effect.orDie),
+    authorize: fs.writeFileString(authorizePath, "authorize").pipe(Effect.orDie),
     cancel: fs
       .writeFileString(cancelPath, "cancel")
-      .pipe(Effect.andThen(fs.exists(startedPath)), Effect.orDie),
+      .pipe(
+        Effect.andThen(
+          Effect.zipWith(fs.exists(readyPath), fs.exists(startedPath), (a, b) => a || b),
+        ),
+        Effect.orDie,
+      ),
     readOutput: Effect.all(
       [stdoutPath, stderrPath].map((file) =>
         collectUint8StreamText({ stream: fs.stream(file), maxBytes: maxOutputBytes }).pipe(

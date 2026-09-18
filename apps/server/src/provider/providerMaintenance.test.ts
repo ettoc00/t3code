@@ -109,7 +109,9 @@ function writeWindowsNpmShim(shim: string, packageName: string, binPath = "bin/p
   const target = NodePath.join("node_modules", ...packageName.split("/"), binPath);
   const contents = /\.cmd$/i.test(shim)
     ? `@ECHO off\r\nSET dp0=%~dp0\r\n"%dp0%\\node.exe" "%dp0%\\${target}" %*\r\n`
-    : `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/node" "$basedir/${target}" "$@"\n`;
+    : /\.ps1$/i.test(shim)
+      ? `#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n& "$basedir/node.exe" "$basedir/${target}" $args\n`
+      : `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/node" "$basedir/${target}" "$@"\n`;
   NodeFS.writeFileSync(shim, contents);
 }
 
@@ -1092,6 +1094,43 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
       );
       expect(unrelatedShim.update).toBeNull();
+
+      for (const [filename, comment] of [
+        ["package-tool.cmd", "REM"],
+        ["package-tool.ps1", "#"],
+        ["package-tool.sh", "#"],
+      ] as const) {
+        const wrapper = NodePath.join(tempDir, filename);
+        for (const candidate of ["package-tool.sh", "package-tool.cmd", "package-tool.ps1"]) {
+          NodeFS.rmSync(NodePath.join(tempDir, candidate), { force: true });
+        }
+        writeWindowsNpmShim(wrapper, "@example/package-tool");
+        const owned = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+          binaryPath: wrapper,
+          env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1;.SH" },
+        }).pipe(
+          Effect.provideService(HostProcessPlatform, "win32"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+        );
+        expect(owned.update, filename).not.toBeNull();
+
+        const target = "node_modules/@example/package-tool/bin/package-tool.js";
+        const decoy =
+          filename === "package-tool.cmd"
+            ? `${comment} "%_prog%" "%dp0%/${target}" %*\r\n`
+            : filename === "package-tool.ps1"
+              ? `<#\n& "$basedir/node.exe" "$basedir/${target}" $args\n#>\n${comment} decoy\n`
+              : `#!/bin/sh\n${comment} exec "$basedir/node" "$basedir/${target}" "$@"\n`;
+        NodeFS.writeFileSync(wrapper, decoy);
+        const commentOnly = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+          binaryPath: wrapper,
+          env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1;.SH" },
+        }).pipe(
+          Effect.provideService(HostProcessPlatform, "win32"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+        );
+        expect(commentOnly.update).toBeNull();
+      }
 
       // The same layout on POSIX is a project checkout, not a global install.
       const script = NodePath.join(tempDir, "package-tool");

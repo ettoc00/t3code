@@ -295,7 +295,6 @@ describe("providerMaintenanceRunner", () => {
         const events: string[] = [];
         let firstStopped = false;
         let installStarts = 0;
-        let exitReads = 0;
         const fs = yield* FileSystem.FileSystem;
         const { registry } = yield* makeRegistry(
           [baseProvider, { ...baseProvider, instanceId: secondInstanceId }],
@@ -331,15 +330,25 @@ describe("providerMaintenanceRunner", () => {
           Layer.succeed(FileSystem.FileSystem, {
             ...fs,
             exists: (file) =>
-              /[\\/]started$/.test(file) ? Effect.succeed(workerStarted) : fs.exists(file),
+              /[\\/](?:ready|started)$/.test(file)
+                ? Effect.succeed(workerStarted)
+                : fs.exists(file),
             writeFileString: (file, content, options) =>
-              fs.writeFileString(file, content, options).pipe(
-                Effect.tap(() =>
-                  Effect.sync(() => {
-                    if (content === "cancel") events.push("cancel");
-                  }),
+              fs
+                .writeFileString(file, content, options)
+                .pipe(
+                  Effect.tap(() =>
+                    content === "cancel"
+                      ? Effect.sync(() => events.push("cancel")).pipe(
+                          Effect.andThen(
+                            workerStarted
+                              ? Deferred.succeed(waitingForExit, undefined)
+                              : Effect.void,
+                          ),
+                        )
+                      : Effect.void,
+                  ),
                 ),
-              ),
           }),
         ).pipe(
           Effect.provideService(
@@ -350,17 +359,14 @@ describe("providerMaintenanceRunner", () => {
                 return Deferred.succeed(started, undefined).pipe(
                   Effect.as({
                     ...mockHandle({
-                      exitCode: Effect.gen(function* () {
-                        // The first read collects command completion; cancellation
-                        // must independently await exit before releasing the lock.
-                        if (++exitReads > 1) yield* Deferred.succeed(waitingForExit, undefined);
-                        return yield* Deferred.await(stopped);
-                      }),
+                      exitCode: Deferred.await(stopped),
                     }),
                     kill: () =>
-                      Effect.sync(() => {
-                        events.push("kill");
-                      }),
+                      Effect.sync(() => events.push("kill")).pipe(
+                        Effect.andThen(
+                          workerStarted ? Effect.void : Deferred.succeed(waitingForExit, undefined),
+                        ),
+                      ),
                   }),
                 );
               }
@@ -515,10 +521,12 @@ describe("providerMaintenanceRunner", () => {
     );
   }
 
-  it.effect("re-checks ownership before an elevated retry", () => {
+  it.effect("re-checks ownership after UAC approval before an elevated retry", () => {
     const commands: string[] = [];
     const freshReads: boolean[] = [];
+    const handshakeWrites: string[] = [];
     return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
       const { registry } = yield* makeRegistry(baseProvider);
       const capabilities = (installationKey: string) =>
         makeProviderMaintenanceCapabilities({
@@ -531,23 +539,46 @@ describe("providerMaintenanceRunner", () => {
           latestVersion: null,
           windowsInstaller: { manager: "winget", scope: "machine" },
         });
-      const updater = yield* makeTestRunner({
-        ...registry,
-        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) => {
-          freshReads.push(options?.fresh === true);
-          return Effect.succeed(
-            capabilities(
-              options?.fresh && freshReads.filter(Boolean).length > 2
-                ? "winget:replacement"
-                : "winget:selected",
-            ),
-          );
+      const updater = yield* makeTestRunner(
+        {
+          ...registry,
+          getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) => {
+            freshReads.push(options?.fresh === true);
+            return Effect.succeed(
+              capabilities(
+                options?.fresh && freshReads.filter(Boolean).length > 2
+                  ? "winget:replacement"
+                  : "winget:selected",
+              ),
+            );
+          },
         },
-      });
+        Layer.succeed(FileSystem.FileSystem, {
+          ...fs,
+          exists: (file) => (/[\\/]ready$/.test(file) ? Effect.succeed(true) : fs.exists(file)),
+          writeFileString: (file, content, options) =>
+            fs.writeFileString(file, content, options).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (content === "cancel" || content === "authorize") {
+                    handshakeWrites.push(content);
+                  }
+                }),
+              ),
+            ),
+        }),
+      );
 
       const result = yield* updater.updateProvider(CODEX_DRIVER);
       assert.deepStrictEqual(freshReads, [false, true, true, true]);
-      assert.deepStrictEqual(commands, ["C:/Tools/winget.exe"]);
+      assert.strictEqual(commands[0], "C:/Tools/winget.exe");
+      assert.match(commands[1] ?? "", /powershell\.exe$/i);
+      assert.strictEqual(commands.length, 2);
+      assert.isAbove(handshakeWrites.length, 0);
+      assert.strictEqual(
+        handshakeWrites.every((write) => write === "cancel"),
+        true,
+      );
       assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
       assert.strictEqual(
         result.providers[0]?.updateState?.message,
@@ -556,6 +587,7 @@ describe("providerMaintenanceRunner", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
+          NodeFileSystem.layer,
           Layer.succeed(HostProcessPlatform, "win32"),
           Layer.succeed(SpawnExecutableResolution, (command) => command),
           latestVersionHttpClient("0.0.1"),
@@ -604,7 +636,7 @@ describe("providerMaintenanceRunner", () => {
     { before: "1.0.0", after: "1.0.0", status: "unchanged" },
     { before: "1.0.0", after: "0.9.0", status: "unchanged" },
     { before: "1.0.0", after: "1.2.0", status: "succeeded" },
-    { before: null, after: "1.2.0", status: "succeeded" },
+    { before: null, after: "1.2.0", status: "unchanged" },
   ])(
     "verifies version advancement with unknown latest: $before -> $after",
     ({ before, after, status }) =>
@@ -672,7 +704,7 @@ describe("providerMaintenanceRunner", () => {
       assert.deepStrictEqual(commands, ["winget"]);
       assert.strictEqual(result.providers[0]?.version, "2.0.0");
       assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
-      assert.match(result.providers[0]?.updateState?.message ?? "", /version did not advance/);
+      assert.match(result.providers[0]?.updateState?.message ?? "", /no applicable update/i);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -682,6 +714,50 @@ describe("providerMaintenanceRunner", () => {
             commands.push(command);
             return { code: 2316632107, stdout: "No available upgrade found." };
           }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("preserves WinGet's no-update result when the version changes concurrently", () => {
+    return Effect.gen(function* () {
+      const { registry, providersRef } = yield* makeRegistry({ ...baseProvider, version: "1.0.0" });
+      let refreshes = 0;
+      const updater = yield* makeTestRunner({
+        ...registry,
+        refreshInstance: () => {
+          refreshes += 1;
+          return refreshes === 1
+            ? Ref.get(providersRef)
+            : Ref.updateAndGet(providersRef, (providers) =>
+                providers.map((provider) => ({ ...provider, version: "2.0.0" })),
+              );
+        },
+        getProviderMaintenanceCapabilitiesForInstance: () =>
+          Effect.succeed(
+            makeProviderMaintenanceCapabilities({
+              provider: CODEX_DRIVER,
+              packageName: "@openai/codex",
+              updateExecutable: "winget",
+              updateArgs: ["upgrade", "--id", "OpenAI.Codex"],
+              updateLockKey: "winget:source:OpenAI.Codex:user",
+              updateInstallationKey: "winget:selected",
+              latestVersion: null,
+              windowsInstaller: { manager: "winget", scope: "user" },
+            }),
+          ),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.strictEqual(result.providers[0]?.version, "2.0.0");
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
+      assert.match(result.providers[0]?.updateState?.message ?? "", /no applicable update/i);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("2.0.0"),
+          mockSpawnerLayer(() => ({ code: 2316632107, stdout: "No available upgrade found." })),
         ),
       ),
     );
@@ -800,12 +876,12 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect("allows Cursor's updater when both versions are unknown but the binary remains", () =>
+  it.effect("does not claim Cursor advanced when both versions are unknown", () =>
     Effect.gen(function* () {
       const { registry } = yield* makeRegistry({ ...baseCursorProvider, version: null });
       const updater = yield* makeTestRunner(registry);
       const result = yield* updater.updateProvider(CURSOR_DRIVER);
-      assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
