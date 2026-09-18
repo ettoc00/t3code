@@ -31,6 +31,7 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCommandAction,
   ProviderVersionCache,
+  resolveLatestProviderVersion,
 } from "./providerMaintenance.ts";
 import type { ProviderMaintenanceCapabilities } from "./providerMaintenance.ts";
 import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
@@ -421,10 +422,42 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                 message: "Updating provider.",
               }),
             );
+            const finishInstallationChanged = (output?: string | null) =>
+              nowIso.pipe(
+                Effect.flatMap((finishedAt) =>
+                  finish(
+                    makeUpdateState({
+                      status: "failed",
+                      startedAt,
+                      finishedAt,
+                      message: "Provider installation changed. Refresh and try again.",
+                      ...(output !== undefined ? { output } : {}),
+                    }),
+                  ),
+                ),
+              );
+
+            // Refresh the exact selected instance before taking the version
+            // baseline. The advisory snapshot may be stale when another
+            // process already updated this installation.
+            const providerBeforeUpdate = (yield* providerRegistry.refreshInstance(instanceId)).find(
+              (candidate) => candidate.driver === provider && candidate.instanceId === instanceId,
+            );
+            if (!providerBeforeUpdate?.installed) {
+              return yield* finish(
+                makeUpdateState({
+                  status: "failed",
+                  startedAt,
+                  finishedAt: yield* nowIso,
+                  message: "T3 Code could not verify the selected provider before updating it.",
+                }),
+              );
+            }
+            const versionBeforeUpdate = providerBeforeUpdate.version?.trim();
 
             // The cached capabilities chose the lock; re-derive ownership
-            // now so the command that runs matches the executable as it is
-            // at click time, not as it was at the last health refresh.
+            // after refreshing the provider so the command matches the
+            // executable that is about to run.
             const fresh = yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
               instanceId,
               provider,
@@ -432,26 +465,58 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             );
             const freshUpdate = fresh.update;
             if (!freshUpdate || !isSameMaintenanceAction(update, freshUpdate)) {
-              return yield* finish(
-                makeUpdateState({
-                  status: "failed",
-                  startedAt,
-                  finishedAt: yield* nowIso,
-                  message: "Provider installation changed. Refresh and try again.",
-                }),
-              );
+              return yield* finishInstallationChanged();
             }
-
-            const versionBeforeUpdate = (yield* providerRegistry.getProviders)
-              .find(
-                (candidate) => candidate.driver === provider && candidate.instanceId === instanceId,
-              )
-              ?.version?.trim();
+            let executionUpdate = freshUpdate;
+            if (freshUpdate.windowsInstaller?.manager === "winget") {
+              const latestInstallerVersion = yield* resolveLatestProviderVersion(fresh).pipe(
+                Effect.provideService(HttpClient.HttpClient, httpClient),
+                Effect.provideService(ProviderVersionCache, versionCache),
+              );
+              if (
+                versionBeforeUpdate &&
+                latestInstallerVersion &&
+                compareSemverVersions(versionBeforeUpdate, latestInstallerVersion) >= 0
+              ) {
+                return yield* finish(
+                  makeUpdateState({
+                    status: "unchanged",
+                    startedAt,
+                    finishedAt: yield* nowIso,
+                    message:
+                      "The selected provider is already at or newer than the latest version available from WinGet.",
+                  }),
+                );
+              }
+              const executionCapabilities =
+                yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
+                  instanceId,
+                  provider,
+                  { fresh: true },
+                );
+              if (
+                !executionCapabilities.update ||
+                !isSameMaintenanceAction(freshUpdate, executionCapabilities.update)
+              ) {
+                return yield* finishInstallationChanged();
+              }
+              executionUpdate = executionCapabilities.update;
+            }
             let result: ProviderMaintenanceCommandResult =
-              yield* runMaintenanceCommand(freshUpdate);
+              yield* runMaintenanceCommand(executionUpdate);
             const needsElevation =
-              platform === "win32" && requiresWindowsAdministrator(freshUpdate, result);
+              platform === "win32" && requiresWindowsAdministrator(executionUpdate, result);
             if (needsElevation) {
+              const elevatedCapabilities =
+                yield* providerRegistry.getProviderMaintenanceCapabilitiesForInstance(
+                  instanceId,
+                  provider,
+                  { fresh: true },
+                );
+              const elevatedUpdate = elevatedCapabilities.update;
+              if (!elevatedUpdate || !isSameMaintenanceAction(executionUpdate, elevatedUpdate)) {
+                return yield* finishInstallationChanged(commandOutput(result));
+              }
               yield* setUpdateState(
                 makeUpdateState({
                   status: "running",
@@ -460,7 +525,6 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                   message: "Approve the Windows administrator prompt to update this provider.",
                 }),
               );
-              const elevatedUpdate = freshUpdate;
               result = yield* Effect.gen(function* () {
                 const elevated = yield* prepareWindowsUpdateElevation(
                   elevatedUpdate,
@@ -489,7 +553,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             // WinGet reports "no applicable update" as a nonzero exit. Still
             // verify the selected provider instead of presenting this as failure.
             if (
-              freshUpdate.windowsInstaller?.manager === "winget" &&
+              executionUpdate.windowsInstaller?.manager === "winget" &&
               result.exitCode !== null &&
               result.exitCode >>> 0 === 0x8a15002b
             ) {
@@ -522,7 +586,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               verified,
               instanceId,
             );
-            const installationChanged = !isSameMaintenanceAction(freshUpdate, verified.update);
+            const installationChanged = !isSameMaintenanceAction(executionUpdate, verified.update);
             // "Succeeded" needs the provider to still be installed: an
             // installer that exits 0 and leaves the binary missing is not a
             // success. Only Cursor tolerates a missing version, since its

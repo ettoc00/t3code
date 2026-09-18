@@ -165,6 +165,7 @@ function makeRegistry(
       Array.isArray(initialProviders) ? initialProviders : [initialProviders],
     );
     const updateStatesRef = yield* Ref.make<ReadonlyArray<ServerProviderUpdateState>>([]);
+    const refreshCounts = new Map<ProviderInstanceId, number>();
 
     const setProviderMaintenanceActionState = Effect.fn(
       "providerMaintenanceRunner.test.setProviderMaintenanceActionState",
@@ -197,8 +198,10 @@ function makeRegistry(
     const registry: ProviderRegistryShape = {
       getProviders: Ref.get(providersRef),
       refresh: () => Ref.get(providersRef),
-      refreshInstance: (instanceId) =>
-        refreshedVersion === undefined
+      refreshInstance: (instanceId) => {
+        const refreshCount = (refreshCounts.get(instanceId) ?? 0) + 1;
+        refreshCounts.set(instanceId, refreshCount);
+        return refreshedVersion === undefined || refreshCount === 1
           ? Ref.get(providersRef)
           : Ref.updateAndGet(providersRef, (providers) =>
               providers.map((provider) =>
@@ -206,7 +209,8 @@ function makeRegistry(
                   ? { ...provider, version: refreshedVersion }
                   : provider,
               ),
-            ),
+            );
+      },
       refreshWorkspaceSnapshot: () => Ref.get(providersRef),
       getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
         Effect.succeed(lifecycleFor(provider)),
@@ -268,7 +272,7 @@ describe("providerMaintenanceRunner", () => {
       });
       const result = yield* runner.updateProvider(CODEX_DRIVER);
       assert.strictEqual(result.providers[0]?.updateState?.status, scope ? "unchanged" : "failed");
-      assert.strictEqual(refreshed, scope !== undefined);
+      assert.strictEqual(refreshed, true);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -511,6 +515,59 @@ describe("providerMaintenanceRunner", () => {
     );
   }
 
+  it.effect("re-checks ownership before an elevated retry", () => {
+    const commands: string[] = [];
+    const freshReads: boolean[] = [];
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider);
+      const capabilities = (installationKey: string) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: "C:/Tools/winget.exe",
+          updateArgs: ["upgrade", "--id", "OpenAI.Codex", "--scope", "machine"],
+          updateLockKey: "winget:source:OpenAI.Codex:machine",
+          updateInstallationKey: installationKey,
+          latestVersion: null,
+          windowsInstaller: { manager: "winget", scope: "machine" },
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) => {
+          freshReads.push(options?.fresh === true);
+          return Effect.succeed(
+            capabilities(
+              options?.fresh && freshReads.filter(Boolean).length > 2
+                ? "winget:replacement"
+                : "winget:selected",
+            ),
+          );
+        },
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(freshReads, [false, true, true, true]);
+      assert.deepStrictEqual(commands, ["C:/Tools/winget.exe"]);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
+      assert.strictEqual(
+        result.providers[0]?.updateState?.message,
+        "Provider installation changed. Refresh and try again.",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(HostProcessPlatform, "win32"),
+          Layer.succeed(SpawnExecutableResolution, (command) => command),
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer((command) => {
+            commands.push(command);
+            return { code: -1978335207 };
+          }),
+        ),
+      ),
+    );
+  });
+
   it.effect("runs the allowlisted provider update command and records success", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     return Effect.gen(function* () {
@@ -556,6 +613,7 @@ describe("providerMaintenanceRunner", () => {
           ...baseProvider,
           version: before,
         });
+        let refreshes = 0;
         const updater = yield* makeTestRunner({
           ...registry,
           getProviderMaintenanceCapabilitiesForInstance: () =>
@@ -563,10 +621,14 @@ describe("providerMaintenanceRunner", () => {
               ...lifecycleFor(CODEX_DRIVER),
               latestVersion: null,
             }),
-          refreshInstance: () =>
-            Ref.updateAndGet(providersRef, (providers) =>
-              providers.map((provider) => ({ ...provider, version: after })),
-            ),
+          refreshInstance: () => {
+            refreshes += 1;
+            return refreshes === 1
+              ? Ref.get(providersRef)
+              : Ref.updateAndGet(providersRef, (providers) =>
+                  providers.map((provider) => ({ ...provider, version: after })),
+                );
+          },
         });
         const result = yield* updater.updateProvider(CODEX_DRIVER);
         assert.strictEqual(result.providers[0]?.updateState?.status, status);
@@ -581,6 +643,98 @@ describe("providerMaintenanceRunner", () => {
       ),
   );
 
+  it.effect("uses a refreshed version baseline when the provider changed outside T3", () => {
+    const commands: string[] = [];
+    return Effect.gen(function* () {
+      const { registry, providersRef } = yield* makeRegistry({ ...baseProvider, version: "1.0.0" });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        refreshInstance: () =>
+          Ref.updateAndGet(providersRef, (providers) =>
+            providers.map((provider) => ({ ...provider, version: "2.0.0" })),
+          ),
+        getProviderMaintenanceCapabilitiesForInstance: () =>
+          Effect.succeed(
+            makeProviderMaintenanceCapabilities({
+              provider: CODEX_DRIVER,
+              packageName: "@openai/codex",
+              updateExecutable: "winget",
+              updateArgs: ["upgrade", "--id", "OpenAI.Codex"],
+              updateLockKey: "winget:source:OpenAI.Codex:user",
+              updateInstallationKey: "winget:selected",
+              latestVersion: null,
+              windowsInstaller: { manager: "winget", scope: "user" },
+            }),
+          ),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(commands, ["winget"]);
+      assert.strictEqual(result.providers[0]?.version, "2.0.0");
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
+      assert.match(result.providers[0]?.updateState?.message ?? "", /version did not advance/);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("2.0.0"),
+          mockSpawnerLayer((command) => {
+            commands.push(command);
+            return { code: 2316632107, stdout: "No available upgrade found." };
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect.each([
+    { latest: "1.9.0", calls: 0, status: "unchanged" },
+    { latest: "2.0.0", calls: 0, status: "unchanged" },
+    { latest: null, calls: 1, status: "succeeded" },
+  ] as const)(
+    "does not downgrade a newer WinGet install: latest=$latest",
+    ({ latest, calls, status }) => {
+      const commands: string[] = [];
+      return Effect.gen(function* () {
+        const { registry } = yield* makeRegistry({ ...baseProvider, version: "2.0.0" }, "2.1.0");
+        const updater = yield* makeTestRunner({
+          ...registry,
+          getProviderMaintenanceCapabilitiesForInstance: () =>
+            Effect.succeed(
+              makeProviderMaintenanceCapabilities({
+                provider: CODEX_DRIVER,
+                packageName: "@openai/codex",
+                updateExecutable: "winget",
+                updateArgs: ["upgrade", "--id", "OpenAI.Codex"],
+                updateLockKey: "winget:source:OpenAI.Codex:user",
+                updateInstallationKey: "winget:selected",
+                latestVersion: latest,
+                windowsInstaller: { manager: "winget", scope: "user" },
+              }),
+            ),
+        });
+
+        const result = yield* updater.updateProvider(CODEX_DRIVER);
+        assert.strictEqual(commands.length, calls);
+        assert.strictEqual(result.providers[0]?.updateState?.status, status);
+        if (latest !== null) {
+          assert.match(result.providers[0]?.updateState?.message ?? "", /already at or newer/);
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NonWindowsPlatform,
+            latestVersionHttpClient("2.1.0"),
+            mockSpawnerLayer((command) => {
+              commands.push(command);
+              return { stdout: "completed" };
+            }),
+          ),
+        ),
+      );
+    },
+  );
+
   it.effect.each([
     { installed: false, version: null },
     { installed: true, version: null },
@@ -589,12 +743,17 @@ describe("providerMaintenanceRunner", () => {
     return Effect.gen(function* () {
       const { registry, providersRef } = yield* makeRegistry(baseProvider);
       // After the update, the refreshed snapshot cannot verify the install/version.
+      let refreshes = 0;
       const updater = yield* makeTestRunner({
         ...registry,
-        refreshInstance: () =>
-          Ref.updateAndGet(providersRef, (providers) =>
-            providers.map((provider) => ({ ...provider, installed, version })),
-          ),
+        refreshInstance: () => {
+          refreshes += 1;
+          return refreshes === 1
+            ? Ref.get(providersRef)
+            : Ref.updateAndGet(providersRef, (providers) =>
+                providers.map((provider) => ({ ...provider, installed, version })),
+              );
+        },
       });
 
       const result = yield* updater.updateProvider(CODEX_DRIVER);
@@ -615,12 +774,17 @@ describe("providerMaintenanceRunner", () => {
     return Effect.gen(function* () {
       const { registry, providersRef } = yield* makeRegistry(baseCursorProvider);
       // A missing post-update version cannot prove that the known install advanced.
+      let refreshes = 0;
       const updater = yield* makeTestRunner({
         ...registry,
-        refreshInstance: () =>
-          Ref.updateAndGet(providersRef, (providers) =>
-            providers.map((provider) => ({ ...provider, installed: true, version: null })),
-          ),
+        refreshInstance: () => {
+          refreshes += 1;
+          return refreshes === 1
+            ? Ref.get(providersRef)
+            : Ref.updateAndGet(providersRef, (providers) =>
+                providers.map((provider) => ({ ...provider, installed: true, version: null })),
+              );
+        },
       });
 
       const result = yield* updater.updateProvider(CURSOR_DRIVER);
@@ -1072,7 +1236,7 @@ describe("providerMaintenanceRunner", () => {
           args: ["i", "-g", "@openai/codex"],
         },
       ]);
-      assert.deepStrictEqual(refreshedInstanceIds, [personalInstanceId]);
+      assert.deepStrictEqual(refreshedInstanceIds, [personalInstanceId, personalInstanceId]);
       assert.strictEqual(result.providers[0]?.instanceId, personalInstanceId);
       assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
       assert.strictEqual(result.providers[1]?.instanceId, workInstanceId);

@@ -422,6 +422,13 @@ const decodeWingetSource = Schema.decodeUnknownOption(
     }),
   ),
 );
+const decodeNpmPackageManifest = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      bin: Schema.Union([Schema.String, Schema.Record(Schema.String, Schema.String)]),
+    }),
+  ),
+);
 
 const readWingetPortableIndex = Effect.fn("readWingetPortableIndex")(
   function* (filename: string) {
@@ -895,36 +902,67 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
 
 /**
  * POSIX npm links `<prefix>/bin/<cmd>` into the package, so the real path is
- * proof. Windows npm writes `.cmd` shims beside `node_modules`, so the proof
- * is the package manifest next to the shim.
+ * proof. On Windows, both the package's declared bin entry and an npm-shaped
+ * shim targeting that entry must match the selected command.
  */
 const resolveNpmGlobalPrefix = Effect.fn("resolveNpmGlobalPrefix")(function* (
   context: ProviderMaintenanceResolutionContext,
   packageName: string,
 ) {
-  const fromRealPath = npmGlobalPrefixFromCommandPath(context.realCommandPath, packageName);
-  if (fromRealPath) {
-    return fromRealPath;
-  }
   if ((yield* HostProcessPlatform) !== "win32") {
-    return null;
+    return npmGlobalPrefixFromCommandPath(context.realCommandPath, packageName);
   }
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const selectedFilename = path.basename(context.resolvedCommandPath);
+  if (/\.(?:exe|com|bat)$/i.test(selectedFilename)) return null;
+  const shimKind = /\.cmd$/i.test(selectedFilename)
+    ? "cmd"
+    : /\.ps1$/i.test(selectedFilename)
+      ? "powershell"
+      : "shell";
+  const commandName = selectedFilename.replace(/\.(?:cmd|ps1)$/i, "");
   const shimDir = path.dirname(context.resolvedCommandPath);
-  const manifestPath = path.join(
-    shimDir,
-    "node_modules",
-    ...packageName.split("/"),
-    "package.json",
-  );
-  // npm writes both `<cmd>.cmd` and an extensionless sh script into the
-  // Windows prefix; either one sits directly beside `node_modules`. A POSIX
-  // project checkout has the same shape, which is why this is Windows-only.
-  const hasManifest = yield* fileSystem
-    .exists(manifestPath)
-    .pipe(Effect.orElseSucceed(() => false));
-  return hasManifest ? shimDir : null;
+  const packageSegments = packageName.split("/");
+  const manifestPath = path.join(shimDir, "node_modules", ...packageSegments, "package.json");
+  const read = (filename: string) =>
+    collectUint8StreamText({
+      stream: fileSystem.stream(filename, { bytesToRead: INSTALLER_PROBE_MAX_BYTES + 1 }),
+      maxBytes: INSTALLER_PROBE_MAX_BYTES,
+    }).pipe(
+      Effect.map((result) => (result.truncated || result.invalidUtf8 ? null : result.text)),
+      Effect.orElseSucceed(() => null),
+    );
+  const manifest = decodeNpmPackageManifest((yield* read(manifestPath)) ?? "");
+  if (Option.isNone(manifest)) return null;
+  const unscopedPackageName = packageSegments.at(-1)?.toLowerCase();
+  const binPath =
+    typeof manifest.value.bin === "string"
+      ? commandName.toLowerCase() === unscopedPackageName
+        ? manifest.value.bin
+        : null
+      : (Object.entries(manifest.value.bin).find(
+          ([name]) => name.toLowerCase() === commandName.toLowerCase(),
+        )?.[1] ?? null);
+  if (!binPath || path.isAbsolute(binPath) || binPath.split(/[\\/]/).includes("..")) return null;
+  const shimText = yield* read(context.resolvedCommandPath);
+  if (!shimText) return null;
+  const recognizedShim =
+    shimKind === "cmd"
+      ? /%(?:~)?dp0%?/i.test(shimText) && /%\*/.test(shimText)
+      : shimKind === "powershell"
+        ? /\$basedir/i.test(shimText) && /\$args/i.test(shimText)
+        : /^#!.*\bsh\b/m.test(shimText) && /\bbasedir=/i.test(shimText) && /"\$@"/.test(shimText);
+  const normalizedBinPath = binPath
+    .split(/[\\/]/)
+    .filter((segment) => segment !== "." && segment !== "")
+    .join("/");
+  const expectedTarget = ["node_modules", ...packageSegments, normalizedBinPath]
+    .join("/")
+    .toLowerCase();
+  return recognizedShim && shimText.replaceAll("\\", "/").toLowerCase().includes(expectedTarget)
+    ? shimDir
+    : null;
 });
 
 export function makePackageManagedProviderMaintenanceResolver(

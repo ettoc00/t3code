@@ -97,6 +97,22 @@ function writeExecutable(path: string) {
   NodeFS.chmodSync(path, 0o755);
 }
 
+function writeWindowsNpmShim(shim: string, packageName: string, binPath = "bin/package-tool.js") {
+  const prefix = NodePath.dirname(shim);
+  const commandName = NodePath.basename(shim).replace(/\.(?:cmd|ps1)$/i, "");
+  const packageDirectory = NodePath.join(prefix, "node_modules", ...packageName.split("/"));
+  NodeFS.mkdirSync(packageDirectory, { recursive: true });
+  NodeFS.writeFileSync(
+    NodePath.join(packageDirectory, "package.json"),
+    JSON.stringify({ name: packageName, bin: { [commandName]: binPath } }),
+  );
+  const target = NodePath.join("node_modules", ...packageName.split("/"), binPath);
+  const contents = /\.cmd$/i.test(shim)
+    ? `@ECHO off\r\nSET dp0=%~dp0\r\n"%dp0%\\node.exe" "%dp0%\\${target}" %*\r\n`
+    : `#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/node" "$basedir/${target}" "$@"\n`;
+  NodeFS.writeFileSync(shim, contents);
+}
+
 /** Symlink `<tempDir>/bin/<name>` into a package entry point, like npm/pnpm do. */
 function linkIntoPackage(tempDir: string, name: string, packageSegments: ReadonlyArray<string>) {
   const target = NodePath.join(tempDir, ...packageSegments, "bin", `${name}.js`);
@@ -421,14 +437,12 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       for (let index = 0; index < 2; index++) {
         const prefix = yield* fs.makeTempDirectoryScoped({ prefix: "t3 grok npm " });
         const shim = NodePath.join(prefix, "grok.cmd");
-        NodeFS.writeFileSync(shim, "fixture");
+        NodeFS.writeFileSync(shim, "unrelated shim");
         const unrelated = NodePath.join(prefix, "node_modules", "grok");
         NodeFS.mkdirSync(unrelated, { recursive: true });
         NodeFS.writeFileSync(NodePath.join(unrelated, "package.json"), "{}");
         expect((yield* f.resolve(shim)).update).toBeNull();
-        const official = NodePath.join(prefix, "node_modules", "@xai-official", "grok");
-        NodeFS.mkdirSync(official, { recursive: true });
-        NodeFS.writeFileSync(NodePath.join(official, "package.json"), "{}");
+        writeWindowsNpmShim(shim, "@xai-official/grok", "bin/grok.js");
         const capabilities = yield* f.resolve(shim);
         expect(capabilities.update).toMatchObject({
           executable: "npm",
@@ -742,22 +756,11 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           ["shims", "tool.cmd"],
           ["apps", "node", "global", "tool.cmd"],
           ["apps", "node", "global", "tool"],
-          ["apps", "node", "global", "tool.exe"],
         ]) {
           const native = segments[0] === ".local";
           const binary = NodePath.join(NodePath.dirname(f.root), ...segments);
-          writeExecutable(binary);
-          if (!native) {
-            const manifest = NodePath.join(
-              NodePath.dirname(binary),
-              "node_modules",
-              "@example",
-              "package-tool",
-              "package.json",
-            );
-            NodeFS.mkdirSync(NodePath.dirname(manifest), { recursive: true });
-            NodeFS.writeFileSync(manifest, '{"name":"@example/package-tool"}');
-          }
+          if (native) writeExecutable(binary);
+          else writeWindowsNpmShim(binary, "@example/package-tool");
           if (native) {
             const result = yield* f.resolve(binary);
             if (failure === "missing-uninstall" || failure === "missing-uninstall-empty")
@@ -785,6 +788,31 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
             expect(result.latestVersion).toBeUndefined();
           }
         }
+
+        const executable = NodePath.join(
+          NodePath.dirname(f.root),
+          "apps",
+          "node",
+          "global",
+          "tool.exe",
+        );
+        writeExecutable(executable);
+        const manifest = NodePath.join(
+          NodePath.dirname(executable),
+          "node_modules",
+          "@example",
+          "package-tool",
+          "package.json",
+        );
+        NodeFS.mkdirSync(NodePath.dirname(manifest), { recursive: true });
+        NodeFS.writeFileSync(
+          manifest,
+          JSON.stringify({
+            name: "@example/package-tool",
+            bin: { tool: "bin/package-tool.js" },
+          }),
+        );
+        expect((yield* f.resolve(executable)).update?.executable).not.toBe("npm");
       }).pipe(Effect.scoped),
     );
   }
@@ -1040,14 +1068,7 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       );
       const shim = NodePath.join(tempDir, "package-tool.cmd");
       NodeFS.mkdirSync(tempDir, { recursive: true });
-      NodeFS.writeFileSync(shim, "@echo off\r\n");
-      NodeFS.mkdirSync(NodePath.join(tempDir, "node_modules", "@example", "package-tool"), {
-        recursive: true,
-      });
-      NodeFS.writeFileSync(
-        NodePath.join(tempDir, "node_modules", "@example", "package-tool", "package.json"),
-        "{}",
-      );
+      writeWindowsNpmShim(shim, "@example/package-tool");
 
       const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
         binaryPath: shim,
@@ -1062,6 +1083,16 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         args: ["install", "-g", "--prefix", tempDir, expect.any(String), expect.any(String)],
       });
 
+      NodeFS.writeFileSync(shim, "@echo off\r\n");
+      const unrelatedShim = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+        binaryPath: shim,
+        env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+      );
+      expect(unrelatedShim.update).toBeNull();
+
       // The same layout on POSIX is a project checkout, not a global install.
       const script = NodePath.join(tempDir, "package-tool");
       writeExecutable(script);
@@ -1073,6 +1104,35 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
       );
       expect(posix.update).toBeNull();
+
+      const executable = NodePath.join(tempDir, "package-tool.exe");
+      writeExecutable(executable);
+      const notNpm = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+        binaryPath: executable,
+        env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+      );
+      expect(notNpm.update).toBeNull();
+
+      const packageExecutable = NodePath.join(
+        tempDir,
+        "node_modules",
+        "@example",
+        "package-tool",
+        "bin",
+        "package-tool.exe",
+      );
+      writeExecutable(packageExecutable);
+      const packageBinary = yield* resolveProviderMaintenanceCapabilitiesEffect(packageToolUpdate, {
+        binaryPath: packageExecutable,
+        env: { PATH: "" },
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+      );
+      expect(packageBinary.update).toBeNull();
     }),
   );
 
