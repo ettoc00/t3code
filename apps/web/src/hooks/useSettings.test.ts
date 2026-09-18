@@ -240,15 +240,17 @@ describe("persistClientSettingsUpdate", () => {
     __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
     let publishedUi = "old";
     const apply = async () => {
-      const result = await persistGuardedClientSettingsUpdate(
+      await persistGuardedClientSettingsUpdate<string>(
         (current) => ({
           settings: { ...current, timestampFormat: "12-hour" },
           value: "new",
           isCurrent: () => true,
+          commit: ({ value }) => {
+            publishedUi = value;
+          },
         }),
         persist,
       );
-      if (result) publishedUi = result.value;
     };
 
     await expect(apply()).rejects.toBe(failure);
@@ -258,6 +260,77 @@ describe("persistClientSettingsUpdate", () => {
     await expect(apply()).resolves.toBeUndefined();
     expect(getClientSettings().timestampFormat).toBe("12-hour");
     expect(publishedUi).toBe("new");
+  });
+
+  it("publishes settings and guarded UI before a queued project mutation", async () => {
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    let projectRoot = "/selected";
+    let publishedUi = "old";
+    let observed: { settings: string; ui: string } | null = null;
+    let guardChecks = 0;
+
+    const pending = persistGuardedClientSettingsUpdate<string>(
+      (current) => ({
+        settings: { ...current, timestampFormat: "12-hour" },
+        value: "new",
+        isCurrent: () => {
+          guardChecks += 1;
+          if (guardChecks === 2) {
+            queueMicrotask(() => {
+              projectRoot = "/elsewhere";
+              observed = { settings: getClientSettings().timestampFormat, ui: publishedUi };
+            });
+          }
+          return projectRoot === "/selected";
+        },
+        commit: ({ previousSettings, value }) => {
+          expect(previousSettings).toBe(DEFAULT_CLIENT_SETTINGS);
+          publishedUi = value;
+        },
+      }),
+      async () => undefined,
+    );
+
+    await pending;
+    await Promise.resolve();
+    expect(observed).toEqual({ settings: "12-hour", ui: "new" });
+    expect(projectRoot).toBe("/elsewhere");
+  });
+
+  it("commits through a metadata-only project upsert during persistence", async () => {
+    let finishPersistence!: () => void;
+    let markPersistenceStarted!: () => void;
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const blockedPersistence = new Promise<void>((resolve) => {
+      finishPersistence = resolve;
+    });
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    let project = { id: "project", workspaceRoot: "/selected", title: "Old title" };
+    let publishedTitle = "";
+
+    const pending = persistGuardedClientSettingsUpdate(
+      (current) => ({
+        settings: { ...current, timestampFormat: "12-hour" },
+        value: undefined,
+        isCurrent: () => project.id === "project" && project.workspaceRoot === "/selected",
+        commit: () => {
+          publishedTitle = project.title;
+        },
+      }),
+      async () => {
+        markPersistenceStarted();
+        await blockedPersistence;
+      },
+    );
+    await persistenceStarted;
+    project = { ...project, title: "New title" };
+    finishPersistence();
+
+    await expect(pending).resolves.not.toBeNull();
+    expect(getClientSettings().timestampFormat).toBe("12-hour");
+    expect(publishedTitle).toBe("New title");
   });
 
   it("rolls back a guarded write when its source changes during persistence", async () => {
@@ -281,18 +354,17 @@ describe("persistClientSettingsUpdate", () => {
         durableSettings = settings;
       });
     __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
-    let project = { workspaceRoot: "/selected" };
+    let project = { id: "project", workspaceRoot: "/selected" };
 
     const pending = persistGuardedClientSettingsUpdate((current) => {
-      const sourceProject = project;
       return {
         settings: { ...current, timestampFormat: "12-hour" },
-        value: sourceProject,
-        isCurrent: () => project === sourceProject,
+        value: undefined,
+        isCurrent: () => project.id === "project" && project.workspaceRoot === "/selected",
       };
     }, persist);
     await persistenceStarted;
-    project = { workspaceRoot: "/elsewhere" };
+    project = { id: "project", workspaceRoot: "/elsewhere" };
     finishPersistence();
 
     await expect(pending).resolves.toBeNull();
@@ -450,22 +522,28 @@ describe("persistClientSettingsUpdate", () => {
       projectOrder: [oldA, oldB],
     };
     const relink = async (previous: EnvironmentProject, moved: EnvironmentProject) => {
-      const persisted = await persistGuardedClientSettingsUpdate((settings) => {
+      await persistGuardedClientSettingsUpdate((settings) => {
         const nextSettings = relinkProjectPreferences(uiState, {
           previous,
           project: moved,
           projects: [movedA, movedB],
           settings,
         });
-        return { settings: nextSettings.settings, value: undefined, isCurrent: () => true };
+        return {
+          settings: nextSettings.settings,
+          value: undefined,
+          isCurrent: () => true,
+          commit: ({ previousSettings }) => {
+            const next = relinkProjectPreferences(uiState, {
+              previous,
+              project: moved,
+              projects: [movedA, movedB],
+              settings: previousSettings,
+            });
+            uiState = next.uiState;
+          },
+        };
       });
-      const next = relinkProjectPreferences(uiState, {
-        previous,
-        project: moved,
-        projects: [movedA, movedB],
-        settings: persisted!.previousSettings,
-      });
-      uiState = next.uiState;
     };
 
     const first = relink(previousA, movedA);

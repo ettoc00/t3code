@@ -203,6 +203,20 @@ export function persistClientSettingsPatch(
   });
 }
 
+interface PersistedClientSettingsUpdate<T> {
+  readonly previousSettings: ClientSettings;
+  readonly settings: ClientSettings;
+  readonly value: T;
+}
+
+interface PreparedClientSettingsUpdate<T> {
+  readonly settings: ClientSettings;
+  readonly value: T;
+  readonly isCurrent: () => boolean;
+  /** Runs synchronously after snapshot replacement and before the queue advances. */
+  readonly commit?: (result: PersistedClientSettingsUpdate<T>) => void;
+}
+
 /**
  * Persists a client-settings update before publishing it to the in-memory
  * snapshot. If another settings write lands while persistence is pending, the
@@ -210,17 +224,9 @@ export function persistClientSettingsPatch(
  * change is lost.
  */
 async function persistPreparedClientSettingsUpdate<T>(
-  prepare: (current: ClientSettings) => {
-    readonly settings: ClientSettings;
-    readonly value: T;
-    readonly isCurrent: () => boolean;
-  } | null,
+  prepare: (current: ClientSettings) => PreparedClientSettingsUpdate<T> | null,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
-): Promise<{
-  readonly previousSettings: ClientSettings;
-  readonly settings: ClientSettings;
-  readonly value: T;
-} | null> {
+): Promise<PersistedClientSettingsUpdate<T> | null> {
   return enqueueClientSettingsPersistence(async () => {
     if (clientSettingsHydrationStatus !== "ready") {
       await hydrateClientSettings();
@@ -240,12 +246,14 @@ async function persistPreparedClientSettingsUpdate<T>(
         return null;
       }
       if (getClientSettingsSnapshot() === current) {
-        replaceClientSettingsSnapshot(prepared.settings);
-        return {
+        const result = {
           previousSettings: current,
           settings: prepared.settings,
           value: prepared.value,
         };
+        replaceClientSettingsSnapshot(prepared.settings);
+        prepared.commit?.(result);
+        return result;
       }
     }
   });
@@ -267,11 +275,7 @@ export async function persistClientSettingsUpdate(
  * If the guard changes during the write, restore the live snapshot before returning null.
  */
 export function persistGuardedClientSettingsUpdate<T>(
-  prepare: (current: ClientSettings) => {
-    readonly settings: ClientSettings;
-    readonly value: T;
-    readonly isCurrent: () => boolean;
-  } | null,
+  prepare: (current: ClientSettings) => PreparedClientSettingsUpdate<T> | null,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
 ) {
   return persistPreparedClientSettingsUpdate(prepare, persist);

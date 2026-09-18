@@ -476,58 +476,55 @@ function ProjectDetail({
       const selectedPath = normalizeProjectPathForComparison(workspaceRoot);
       const handoff = beginProjectFolderPreferenceHandoff(ref, previous);
       const applyPreferences = async (pending: ProjectFolderPreferenceHandoff<typeof previous>) => {
+        const readTarget = () => {
+          const currentProject = readProject(ref);
+          if (
+            currentProject === null ||
+            normalizeProjectPathForComparison(currentProject.workspaceRoot) !== selectedPath
+          ) {
+            return null;
+          }
+          const projects = readProjects();
+          const project = projects.find(
+            (item) =>
+              item.environmentId === ref.environmentId &&
+              item.id === ref.projectId &&
+              normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
+          );
+          return project ? { project, projects } : null;
+        };
         const preferences = await settlePromise(() =>
           applyProjectFolderPreferenceHandoff(pending, async (preferenceSource) => {
             const persisted = await persistGuardedClientSettingsUpdate((settings) => {
               if (!isProjectFolderPreferenceHandoffCurrent(pending)) return null;
-              const currentProject = readProject(ref);
-              if (
-                currentProject === null ||
-                normalizeProjectPathForComparison(currentProject.workspaceRoot) !== selectedPath
-              ) {
-                return null;
-              }
-              const projects = readProjects();
-              const project = projects.find(
-                (item) =>
-                  item.environmentId === ref.environmentId &&
-                  item.id === ref.projectId &&
-                  normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
-              );
-              if (!project) return null;
+              const target = readTarget();
+              if (!target) return null;
               const isCurrent = () =>
-                isProjectFolderPreferenceHandoffCurrent(pending) &&
-                readProject(ref) === currentProject;
+                isProjectFolderPreferenceHandoffCurrent(pending) && readTarget() !== null;
               const next = relinkProjectPreferences(useUiStateStore.getState(), {
                 previous: preferenceSource,
-                project,
-                projects,
+                project: target.project,
+                projects: target.projects,
                 settings,
               });
               return {
                 settings: next.settings,
-                value: { currentProject, project, projects },
+                value: undefined,
                 isCurrent,
+                commit: ({ previousSettings }) => {
+                  const latest = readTarget();
+                  if (!isProjectFolderPreferenceHandoffCurrent(pending) || !latest) return;
+                  const committed = relinkProjectPreferences(useUiStateStore.getState(), {
+                    previous: preferenceSource,
+                    project: latest.project,
+                    projects: latest.projects,
+                    settings: previousSettings,
+                  });
+                  useUiStateStore.setState(committed.uiState);
+                },
               };
             });
-            if (persisted === null) return false;
-            if (!isProjectFolderPreferenceHandoffCurrent(pending)) return false;
-            const { currentProject, project, projects } = persisted.value;
-            if (readProject(ref) !== currentProject) return false;
-            const next = relinkProjectPreferences(useUiStateStore.getState(), {
-              previous: preferenceSource,
-              project,
-              projects,
-              settings: persisted.previousSettings,
-            });
-            if (
-              !isProjectFolderPreferenceHandoffCurrent(pending) ||
-              readProject(ref) !== currentProject
-            ) {
-              return false;
-            }
-            useUiStateStore.setState(next.uiState);
-            return true;
+            return persisted !== null;
           }),
         );
         reportFailure(
