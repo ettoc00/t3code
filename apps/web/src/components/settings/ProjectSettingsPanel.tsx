@@ -495,36 +495,46 @@ function ProjectDetail({
         };
         const preferences = await settlePromise(() =>
           applyProjectFolderPreferenceHandoff(pending, async (preferenceSource) => {
-            const persisted = await persistGuardedClientSettingsUpdate((settings) => {
-              if (!isProjectFolderPreferenceHandoffCurrent(pending)) return null;
-              const target = readTarget();
-              if (!target) return null;
-              const isCurrent = () =>
-                isProjectFolderPreferenceHandoffCurrent(pending) && readTarget() !== null;
-              const next = relinkProjectPreferences(useUiStateStore.getState(), {
-                previous: preferenceSource,
-                project: target.project,
-                projects: target.projects,
-                settings,
-              });
-              return {
-                settings: next.settings,
-                value: undefined,
-                isCurrent,
-                commit: ({ previousSettings }) => {
+            for (;;) {
+              const persisted = await persistGuardedClientSettingsUpdate((settings) => {
+                if (!isProjectFolderPreferenceHandoffCurrent(pending)) return null;
+                const target = readTarget();
+                if (!target) return null;
+                const isCurrent = () => {
                   const latest = readTarget();
-                  if (!isProjectFolderPreferenceHandoffCurrent(pending) || !latest) return;
-                  const committed = relinkProjectPreferences(useUiStateStore.getState(), {
-                    previous: preferenceSource,
-                    project: latest.project,
-                    projects: latest.projects,
-                    settings: previousSettings,
-                  });
-                  useUiStateStore.setState(committed.uiState);
-                },
-              };
-            });
-            return persisted !== null;
+                  return (
+                    isProjectFolderPreferenceHandoffCurrent(pending) &&
+                    latest?.projects === target.projects
+                  );
+                };
+                const next = relinkProjectPreferences(useUiStateStore.getState(), {
+                  previous: preferenceSource,
+                  project: target.project,
+                  projects: target.projects,
+                  settings,
+                });
+                return {
+                  settings: next.settings,
+                  value: undefined,
+                  isCurrent,
+                  commit: ({ previousSettings }) => {
+                    const latest = readTarget();
+                    if (!isProjectFolderPreferenceHandoffCurrent(pending) || !latest) return;
+                    const committed = relinkProjectPreferences(useUiStateStore.getState(), {
+                      previous: preferenceSource,
+                      project: latest.project,
+                      projects: latest.projects,
+                      settings: previousSettings,
+                    });
+                    useUiStateStore.setState(committed.uiState);
+                  },
+                };
+              });
+              if (persisted !== null) return true;
+              if (!isProjectFolderPreferenceHandoffCurrent(pending) || readTarget() === null) {
+                return false;
+              }
+            }
           }),
         );
         reportFailure(

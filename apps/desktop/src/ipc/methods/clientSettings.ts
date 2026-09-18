@@ -1,4 +1,5 @@
 import { ClientSettingsSchema } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -26,6 +27,12 @@ export const setClientSettings = DesktopIpc.makeIpcMethod({
     const clientSettings = yield* DesktopClientSettings.DesktopClientSettings;
     const snapShot = yield* DesktopSnapShot.DesktopSnapShot;
     yield* clientSettings.set(settings);
-    yield* snapShot.configure(settings);
+    yield* snapShot.configure(settings).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not reconfigure SnapShots after saving client settings.", {
+          cause: Cause.pretty(cause),
+        }),
+      ),
+    );
   }),
 });

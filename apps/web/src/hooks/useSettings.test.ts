@@ -8,7 +8,7 @@ import {
 import { DEFAULT_CLIENT_SETTINGS, type ClientSettings } from "@t3tools/contracts/settings";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { derivePhysicalProjectKey } from "../logicalProject";
+import { deriveLogicalProjectKeyFromSettings, derivePhysicalProjectKey } from "../logicalProject";
 import type { UiProjectState } from "../uiStateStore";
 import { relinkProjectPreferences } from "../components/settings/ProjectSettingsPanel.logic";
 
@@ -20,6 +20,40 @@ const persistenceMocks = vi.hoisted(() => ({
 vi.mock("~/localApi", () => ({
   ensureLocalApi: () => ({ persistence: persistenceMocks }),
 }));
+
+function relinkIdentity(canonicalKey: string, rootPath: string) {
+  return {
+    canonicalKey,
+    rootPath,
+    locator: {
+      source: "git-remote" as const,
+      remoteName: "origin",
+      remoteUrl: `https://${canonicalKey}.git`,
+    },
+    provider: "github",
+    owner: "example",
+    name: canonicalKey,
+    displayName: canonicalKey,
+  };
+}
+
+function relinkProject(
+  id: string,
+  workspaceRoot: string,
+  repositoryIdentity: EnvironmentProject["repositoryIdentity"],
+): EnvironmentProject {
+  return {
+    id: ProjectId.make(id),
+    environmentId: EnvironmentId.make("environment"),
+    title: id,
+    workspaceRoot,
+    repositoryIdentity,
+    defaultModelSelection: null,
+    scripts: [],
+    createdAt: "2026-09-18T00:00:00.000Z",
+    updatedAt: "2026-09-18T00:00:00.000Z",
+  };
+}
 
 import {
   __resetClientSettingsPersistenceForTests,
@@ -198,6 +232,105 @@ describe("persistClientSettingsPatch", () => {
 });
 
 describe("persistClientSettingsUpdate", () => {
+  async function expectRelinkTopologyRetry(input: {
+    previous: EnvironmentProject;
+    initialProjects: ReadonlyArray<EnvironmentProject>;
+    finalProjects: ReadonlyArray<EnvironmentProject>;
+  }) {
+    const targetId = input.previous.id;
+    const selectedRoot = "/repo/new";
+    const baseSettings: ClientSettings = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      sidebarProjectGroupingMode: "repository_path",
+    };
+    const oldGroup = deriveLogicalProjectKeyFromSettings(input.previous, baseSettings);
+    const savedSettings: ClientSettings = {
+      ...baseSettings,
+      pullRequestMergeMethodOverrides: { [oldGroup]: "rebase" },
+    };
+    const initialUi: UiProjectState = {
+      sidebarProjectScopeKey: oldGroup,
+      projectExpandedById: { [oldGroup]: false },
+      projectOrder: [derivePhysicalProjectKey(input.previous)],
+    };
+    let uiState = initialUi;
+    let projects = input.initialProjects;
+    let durableSettings = savedSettings;
+    let finishPersistence!: () => void;
+    let markPersistenceStarted!: () => void;
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const blockedPersistence = new Promise<void>((resolve) => {
+      finishPersistence = resolve;
+    });
+    const persist = vi
+      .fn<(settings: ClientSettings) => Promise<void>>()
+      .mockImplementationOnce(async (settings) => {
+        markPersistenceStarted();
+        await blockedPersistence;
+        durableSettings = settings;
+      })
+      .mockImplementation(async (settings) => {
+        durableSettings = settings;
+      });
+    __setClientSettingsForTests(savedSettings);
+    const readTarget = () =>
+      projects.find(
+        (project) => project.id === targetId && project.workspaceRoot === selectedRoot,
+      ) ?? null;
+
+    const migration = (async () => {
+      for (;;) {
+        const persisted = await persistGuardedClientSettingsUpdate((settings) => {
+          const target = readTarget();
+          if (!target) return null;
+          const preparedProjects = projects;
+          const next = relinkProjectPreferences(uiState, {
+            previous: input.previous,
+            project: target,
+            projects: preparedProjects,
+            settings,
+          });
+          return {
+            settings: next.settings,
+            value: undefined,
+            isCurrent: () => projects === preparedProjects && readTarget() !== null,
+            commit: ({ previousSettings }) => {
+              const latest = readTarget();
+              if (!latest) return;
+              uiState = relinkProjectPreferences(uiState, {
+                previous: input.previous,
+                project: latest,
+                projects,
+                settings: previousSettings,
+              }).uiState;
+            },
+          };
+        }, persist);
+        if (persisted) return;
+      }
+    })();
+
+    await persistenceStarted;
+    projects = input.finalProjects;
+    finishPersistence();
+    await migration;
+
+    const finalTarget = readTarget();
+    if (!finalTarget) throw new Error("final relink target is missing");
+    const expected = relinkProjectPreferences(initialUi, {
+      previous: input.previous,
+      project: finalTarget,
+      projects: input.finalProjects,
+      settings: savedSettings,
+    });
+    expect(durableSettings).toEqual(expected.settings);
+    expect(getClientSettings()).toEqual(expected.settings);
+    expect(uiState).toEqual(expected.uiState);
+    expect(persist).toHaveBeenCalledTimes(3);
+  }
+
   it("publishes the update only after persistence succeeds", async () => {
     let finishPersistence!: () => void;
     const persistence = new Promise<void>((resolve) => {
@@ -332,6 +465,45 @@ describe("persistClientSettingsUpdate", () => {
     expect(getClientSettings().timestampFormat).toBe("12-hour");
     expect(publishedTitle).toBe("New title");
   });
+
+  it.each([
+    ["missing", null],
+    ["R1", relinkIdentity("github.com/example/r1", "/repo")],
+  ])("retries a %s repository identity as the final R2 topology", async (_, initialIdentity) => {
+    const r1 = relinkIdentity("github.com/example/r1", "/repo");
+    const r2 = relinkIdentity("github.com/example/r2", "/repo");
+    const previous = relinkProject("project", "/repo/old", r1);
+    const initial = relinkProject("project", "/repo/new", initialIdentity);
+    const final = relinkProject("project", "/repo/new", r2);
+
+    await expectRelinkTopologyRetry({
+      previous,
+      initialProjects: [initial],
+      finalProjects: [final],
+    });
+  });
+
+  it.each(["join", "leave"] as const)(
+    "retries when another checkout %ss the old logical group",
+    async (change) => {
+      const r1 = relinkIdentity("github.com/example/r1", "/repo");
+      const r2 = relinkIdentity("github.com/example/r2", "/repo");
+      const previous = relinkProject("project", "/repo/old", r1);
+      const moved = relinkProject("project", "/repo/new", r2);
+      const sibling = relinkProject("sibling", "/clone/old", {
+        ...r1,
+        rootPath: "/clone",
+      });
+      const alone = [moved];
+      const withSibling = [moved, sibling];
+
+      await expectRelinkTopologyRetry({
+        previous,
+        initialProjects: change === "join" ? alone : withSibling,
+        finalProjects: change === "join" ? withSibling : alone,
+      });
+    },
+  );
 
   it("rolls back a guarded write when its source changes during persistence", async () => {
     let finishPersistence!: () => void;
