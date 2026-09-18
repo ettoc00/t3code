@@ -161,6 +161,7 @@ import {
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   planSidebarThreadDrop,
+  planSidebarProjectScopeRecovery,
   reduceSidebarProjectScopeMenuState,
   resolveAdjacentThreadId,
   resolveSidebarDropTarget,
@@ -2426,24 +2427,15 @@ export default function Sidebar() {
   const allProjectSnapshotsReady = useAllEnvironmentProjectSnapshotsReady();
   const previousScopedProjectGroup = useRef(scopedProjectGroup);
   useEffect(() => {
-    if (projectScopeKey !== null && allProjectSnapshotsReady && scopedProjectGroup === null) {
-      // Relinking changes the path-derived group key, but keeps the project IDs.
-      const previous = previousScopedProjectGroup.current;
-      const successor =
-        previous?.projectKey === projectScopeKey
-          ? projectGroups.find((group) =>
-              group.memberProjectRefs.some((member) =>
-                previous.memberProjectRefs.some(
-                  (old) =>
-                    old.environmentId === member.environmentId &&
-                    old.projectId === member.projectId,
-                ),
-              ),
-            )
-          : undefined;
-      setProjectScopeKey(successor?.projectKey ?? null);
-    }
-    previousScopedProjectGroup.current = scopedProjectGroup;
+    const recovery = planSidebarProjectScopeRecovery({
+      projectScopeKey,
+      allProjectSnapshotsReady,
+      scopedProjectGroup,
+      previousScopedProjectGroup: previousScopedProjectGroup.current,
+      projectGroups,
+    });
+    previousScopedProjectGroup.current = recovery.rememberedGroup;
+    if (recovery.updateScope) setProjectScopeKey(recovery.projectScopeKey);
   }, [
     allProjectSnapshotsReady,
     projectGroups,

@@ -36,6 +36,7 @@ import {
   resolveSidebarDropTarget,
   pinOrderKeyBetween,
   planPinnedReorder,
+  planSidebarProjectScopeRecovery,
   planSidebarThreadDrop,
   sidebarMarkerId,
   sidebarListItemId,
@@ -2478,6 +2479,51 @@ describe("sortLogicalProjectsForSidebar", () => {
         (project) => project.projectKey,
       ),
     ).toEqual(["logical-newer", "logical-older"]);
+  });
+});
+
+describe("sidebar project scope recovery", () => {
+  const projectRef = { environmentId: "environment-local", projectId: "project" };
+  const previousGroup = { projectKey: "environment-local:/old", memberProjectRefs: [projectRef] };
+  const successorGroup = { projectKey: "environment-local:/new", memberProjectRefs: [projectRef] };
+
+  it("retains the previous group until every environment is ready to resolve a relink", () => {
+    const whileIncomplete = planSidebarProjectScopeRecovery({
+      projectScopeKey: previousGroup.projectKey,
+      allProjectSnapshotsReady: false,
+      scopedProjectGroup: null,
+      previousScopedProjectGroup: previousGroup,
+      projectGroups: [successorGroup],
+    });
+    expect(whileIncomplete).toEqual({ rememberedGroup: previousGroup, updateScope: false });
+
+    const onceReady = planSidebarProjectScopeRecovery({
+      projectScopeKey: previousGroup.projectKey,
+      allProjectSnapshotsReady: true,
+      scopedProjectGroup: null,
+      previousScopedProjectGroup: whileIncomplete.rememberedGroup,
+      projectGroups: [successorGroup],
+    });
+    expect(onceReady).toEqual({
+      rememberedGroup: previousGroup,
+      updateScope: true,
+      projectScopeKey: successorGroup.projectKey,
+    });
+  });
+
+  it("falls back only after readiness proves that no successor exists", () => {
+    const recovery = planSidebarProjectScopeRecovery({
+      projectScopeKey: previousGroup.projectKey,
+      allProjectSnapshotsReady: true,
+      scopedProjectGroup: null,
+      previousScopedProjectGroup: previousGroup,
+      projectGroups: [],
+    });
+    expect(recovery).toEqual({
+      rememberedGroup: previousGroup,
+      updateScope: true,
+      projectScopeKey: null,
+    });
   });
 });
 

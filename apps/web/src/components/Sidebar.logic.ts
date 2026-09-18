@@ -395,6 +395,50 @@ type LogicalSidebarProject = SidebarProject & {
   }[];
 };
 
+type SidebarProjectScopeGroup = Pick<LogicalSidebarProject, "projectKey" | "memberProjectRefs">;
+
+/** Keep the last resolved group while incomplete environment snapshots hide its relink successor. */
+export function planSidebarProjectScopeRecovery<TGroup extends SidebarProjectScopeGroup>(input: {
+  readonly projectScopeKey: string | null;
+  readonly allProjectSnapshotsReady: boolean;
+  readonly scopedProjectGroup: TGroup | null;
+  readonly previousScopedProjectGroup: TGroup | null;
+  readonly projectGroups: readonly TGroup[];
+}):
+  | { readonly rememberedGroup: TGroup | null; readonly updateScope: false }
+  | {
+      readonly rememberedGroup: TGroup | null;
+      readonly updateScope: true;
+      readonly projectScopeKey: string | null;
+    } {
+  const rememberedGroup = input.scopedProjectGroup ?? input.previousScopedProjectGroup;
+  if (
+    input.projectScopeKey === null ||
+    !input.allProjectSnapshotsReady ||
+    input.scopedProjectGroup !== null
+  ) {
+    return { rememberedGroup, updateScope: false };
+  }
+
+  const successor =
+    rememberedGroup?.projectKey === input.projectScopeKey
+      ? input.projectGroups.find((group) =>
+          group.memberProjectRefs.some((member) =>
+            rememberedGroup.memberProjectRefs.some(
+              (previous) =>
+                previous.environmentId === member.environmentId &&
+                previous.projectId === member.projectId,
+            ),
+          ),
+        )
+      : undefined;
+  return {
+    rememberedGroup,
+    updateScope: true,
+    projectScopeKey: successor?.projectKey ?? null,
+  };
+}
+
 export type ThreadTraversalDirection = "previous" | "next";
 
 /**
