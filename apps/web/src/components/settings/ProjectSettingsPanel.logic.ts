@@ -99,14 +99,16 @@ function expansionPreferenceKeys(group: ProjectGroup): string[] {
 }
 
 /** Carry checkout preferences without moving a group that still has other members. */
-export function relinkProjectPreferences(
+export function relinkProjectPreferences<
+  TSettings extends ProjectGroupingSettings &
+    Pick<ClientSettings, "pullRequestMergeMethodOverrides">,
+>(
   state: UiProjectState,
   input: {
     readonly previous: EnvironmentProject;
     readonly project: EnvironmentProject;
     readonly projects: ReadonlyArray<EnvironmentProject>;
-    readonly settings: ProjectGroupingSettings &
-      Pick<ClientSettings, "pullRequestMergeMethodOverrides">;
+    readonly settings: TSettings;
   },
 ) {
   const { previous, project, projects, settings } = input;

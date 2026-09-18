@@ -1,10 +1,16 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  EnvironmentId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS, type ClientSettings } from "@t3tools/contracts/settings";
+import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { derivePhysicalProjectKey } from "../logicalProject";
+import type { UiProjectState } from "../uiStateStore";
+import { relinkProjectPreferences } from "../components/settings/ProjectSettingsPanel.logic";
 
 const persistenceMocks = vi.hoisted(() => ({
   getClientSettings: vi.fn<() => Promise<ClientSettings | null>>(),
@@ -324,6 +330,85 @@ describe("persistClientSettingsUpdate", () => {
     await expect(
       persistClientSettingsUpdate((current) => ({ ...current, wordWrap: false }), persist),
     ).resolves.toMatchObject({ wordWrap: false });
+  });
+
+  it("hydrates before serializing concurrent project relink migrations", async () => {
+    let finishHydration!: (settings: ClientSettings) => void;
+    let markHydrationStarted!: () => void;
+    const hydrationStarted = new Promise<void>((resolve) => {
+      markHydrationStarted = resolve;
+    });
+    persistenceMocks.getClientSettings.mockImplementationOnce(
+      () =>
+        new Promise<ClientSettings>((resolve) => {
+          finishHydration = resolve;
+          markHydrationStarted();
+        }),
+    );
+    let durableSettings = DEFAULT_CLIENT_SETTINGS;
+    persistenceMocks.setClientSettings.mockImplementation(async (settings) => {
+      durableSettings = settings;
+    });
+
+    const project = (id: string, workspaceRoot: string): EnvironmentProject => ({
+      id: ProjectId.make(id),
+      environmentId: EnvironmentId.make("environment"),
+      title: id,
+      workspaceRoot,
+      repositoryIdentity: null,
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-09-18T00:00:00.000Z",
+      updatedAt: "2026-09-18T00:00:00.000Z",
+    });
+    const previousA = project("project-a", "/old/a");
+    const previousB = project("project-b", "/old/b");
+    const movedA = { ...previousA, workspaceRoot: "/new/a" };
+    const movedB = { ...previousB, workspaceRoot: "/new/b" };
+    const oldA = derivePhysicalProjectKey(previousA);
+    const oldB = derivePhysicalProjectKey(previousB);
+    const newA = derivePhysicalProjectKey(movedA);
+    const newB = derivePhysicalProjectKey(movedB);
+    const savedSettings: ClientSettings = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      sidebarProjectGroupingMode: "separate",
+      sidebarProjectGroupingOverrides: { [oldA]: "separate", [oldB]: "separate" },
+      pullRequestMergeMethodOverrides: { [oldA]: "rebase", [oldB]: "squash" },
+    };
+    let uiState: UiProjectState = {
+      sidebarProjectScopeKey: null,
+      projectExpandedById: {},
+      projectOrder: [oldA, oldB],
+    };
+    const relink = (previous: EnvironmentProject, moved: EnvironmentProject) =>
+      persistClientSettingsUpdate((settings) => {
+        const next = relinkProjectPreferences(uiState, {
+          previous,
+          project: moved,
+          projects: [movedA, movedB],
+          settings,
+        });
+        uiState = next.uiState;
+        return next.settings;
+      });
+
+    const first = relink(previousA, movedA);
+    const second = relink(previousB, movedB);
+    await hydrationStarted;
+    expect(persistenceMocks.setClientSettings).not.toHaveBeenCalled();
+    finishHydration(savedSettings);
+    await Promise.all([first, second]);
+
+    expect(durableSettings.sidebarProjectGroupingOverrides).toEqual({
+      [newA]: "separate",
+      [newB]: "separate",
+    });
+    expect(durableSettings.pullRequestMergeMethodOverrides).toEqual({
+      [newA]: "rebase",
+      [newB]: "squash",
+    });
+    expect(getClientSettings()).toBe(durableSettings);
+    expect(uiState.projectOrder).toEqual([newA, newB]);
   });
 });
 

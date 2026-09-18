@@ -28,7 +28,12 @@ import {
   waitForProject,
   useThreadShells,
 } from "../../state/entities";
-import { serializeProjectFolderUpdate } from "../../state/projectFolderUpdate";
+import {
+  applyProjectFolderPreferenceHandoff,
+  beginProjectFolderPreferenceHandoff,
+  serializeProjectFolderUpdate,
+  type ProjectFolderPreferenceHandoff,
+} from "../../state/projectFolderUpdate";
 import { projectEnvironment } from "../../state/projects";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { ProjectFavicon } from "../ProjectFavicon";
@@ -55,7 +60,7 @@ import {
 } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 
-import { getClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
+import { persistClientSettingsUpdate } from "../../hooks/useSettings";
 import { openCommandPalette } from "../../commandPaletteBus";
 import { getBrowseParentPath, normalizeProjectPathForComparison } from "../../lib/projectPaths";
 import { useUiStateStore } from "../../uiStateStore";
@@ -450,7 +455,6 @@ function ProjectDetail({
     ],
   );
 
-  const updateClientSettings = useUpdateClientSettings();
   const updateCheckoutFolder = async (
     selectedCheckout: SidebarProjectGroupMember,
     workspaceRoot: string,
@@ -470,39 +474,49 @@ function ProjectDetail({
       if (result._tag === "Failure") return false;
       const selectedPath = normalizeProjectPathForComparison(workspaceRoot);
       if (normalizeProjectPathForComparison(previous.workspaceRoot) === selectedPath) return true;
+      const handoff = beginProjectFolderPreferenceHandoff(ref, previous);
+      const applyPreferences = async (pending: ProjectFolderPreferenceHandoff<typeof previous>) => {
+        const projects = readProjects();
+        const project = projects.find(
+          (item) =>
+            item.environmentId === ref.environmentId &&
+            item.id === ref.projectId &&
+            normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
+        );
+        if (!project) return;
+        const preferences = await settlePromise(() =>
+          applyProjectFolderPreferenceHandoff(pending, project, async (preferenceSource) => {
+            await persistClientSettingsUpdate((settings) => {
+              const next = relinkProjectPreferences(useUiStateStore.getState(), {
+                previous: preferenceSource,
+                project,
+                projects,
+                settings,
+              });
+              useUiStateStore.setState(next.uiState);
+              return next.settings;
+            });
+          }),
+        );
+        reportFailure(
+          "Folder updated, but project preferences could not follow it",
+          mapAtomCommandResult(preferences, () => undefined),
+        );
+      };
+
       // The palette submits a resolved server browse path, not the typed query.
       const updated = await settlePromise(() => waitForProject(ref, { workspaceRoot }));
-      reportFailure(
-        "Folder updated, but project preferences could not follow it",
-        mapAtomCommandResult(updated, () => undefined),
-      );
-      if (updated._tag === "Failure") return true;
-      const projects = readProjects();
-      const project = projects.find(
-        (item) =>
-          item.environmentId === ref.environmentId &&
-          item.id === ref.projectId &&
-          normalizeProjectPathForComparison(item.workspaceRoot) === selectedPath,
-      );
-      if (!project) return true;
-      const settings = getClientSettings();
-      const next = relinkProjectPreferences(useUiStateStore.getState(), {
-        previous,
-        project,
-        projects,
-        settings,
-      });
-      useUiStateStore.setState(next.uiState);
-      if (
-        next.settings.sidebarProjectGroupingOverrides !==
-          settings.sidebarProjectGroupingOverrides ||
-        next.settings.pullRequestMergeMethodOverrides !== settings.pullRequestMergeMethodOverrides
-      ) {
-        updateClientSettings({
-          sidebarProjectGroupingOverrides: next.settings.sidebarProjectGroupingOverrides,
-          pullRequestMergeMethodOverrides: next.settings.pullRequestMergeMethodOverrides,
-        });
+      if (updated._tag === "Success") {
+        await applyPreferences(handoff);
+        return true;
       }
+      void waitForProject(ref, {
+        workspaceRoot,
+        timeoutMs: null,
+        signal: handoff.signal,
+      })
+        .then(() => serializeProjectFolderUpdate(ref, () => applyPreferences(handoff)))
+        .catch(() => undefined);
       return true;
     });
   };

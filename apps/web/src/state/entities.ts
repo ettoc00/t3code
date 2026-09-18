@@ -158,7 +158,11 @@ export function readProjects(): ReadonlyArray<EnvironmentProject> {
 /** Resolves when the project event reaches the live client store. */
 export function waitForProject(
   ref: ScopedProjectRef,
-  options: { readonly workspaceRoot?: string; readonly timeoutMs?: number } = {},
+  options: {
+    readonly workspaceRoot?: string;
+    readonly timeoutMs?: number | null;
+    readonly signal?: AbortSignal;
+  } = {},
 ): Promise<EnvironmentProject> {
   const expectedPath =
     options.workspaceRoot === undefined
@@ -168,21 +172,37 @@ export function waitForProject(
     project !== null &&
     (expectedPath === undefined ||
       normalizeProjectPathForComparison(project.workspaceRoot) === expectedPath);
+  if (options.signal?.aborted) {
+    return Promise.reject(new Error("The project wait was cancelled."));
+  }
   const current = readProject(ref);
   if (matches(current)) return Promise.resolve(current);
 
   return new Promise((resolve, reject) => {
     let unsubscribe: (() => void) | null = null;
-    const timeout = setTimeout(() => {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timeout !== null) clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", cancel);
       unsubscribe?.();
-      reject(new Error("The project did not appear in the desktop app."));
-    }, options.timeoutMs ?? 10_000);
+    };
+    const cancel = () => {
+      cleanup();
+      reject(new Error("The project wait was cancelled."));
+    };
+    timeout =
+      options.timeoutMs === null
+        ? null
+        : setTimeout(() => {
+            cleanup();
+            reject(new Error("The project did not appear in the desktop app."));
+          }, options.timeoutMs ?? 10_000);
     const finish = (project: EnvironmentProject | null) => {
       if (!matches(project)) return;
-      clearTimeout(timeout);
-      unsubscribe?.();
+      cleanup();
       resolve(project);
     };
+    options.signal?.addEventListener("abort", cancel, { once: true });
     unsubscribe = appAtomRegistry.subscribe(environmentProjects.projectAtom(ref), finish);
     finish(readProject(ref));
   });

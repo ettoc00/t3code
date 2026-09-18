@@ -60,6 +60,11 @@ vi.mock("./projects", async () => {
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentSnapshotAtom } from "./shell";
 import { waitForProject } from "./entities";
+import {
+  applyProjectFolderPreferenceHandoff,
+  beginProjectFolderPreferenceHandoff,
+  serializeProjectFolderUpdate,
+} from "./projectFolderUpdate";
 
 const ref = {
   environmentId: EnvironmentId.make("folder-environment"),
@@ -200,5 +205,52 @@ describe("project folder updates", () => {
     await vi.advanceTimersByTimeAsync(10);
     await failure;
     expect(appAtomRegistry.get(atom)?.projects[0]?.workspaceRoot).toBe("/elsewhere");
+  });
+
+  it("hands delayed preferences to the newest relink after the foreground timeout", async () => {
+    await publish([snapshot(1, "/old")]);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const firstForeground = waitForProject(ref, { workspaceRoot: "/intermediate", timeoutMs: 10 });
+    const firstFailure = expect(firstForeground).rejects.toThrow("project did not appear");
+    await vi.advanceTimersByTimeAsync(10);
+    await firstFailure;
+
+    const applied: Array<{ previous: string; project: string }> = [];
+    const firstHandoff = beginProjectFolderPreferenceHandoff(ref, "/old");
+    const firstEventual = waitForProject(ref, {
+      workspaceRoot: "/intermediate",
+      timeoutMs: null,
+      signal: firstHandoff.signal,
+    }).then(() =>
+      serializeProjectFolderUpdate(ref, () =>
+        applyProjectFolderPreferenceHandoff(
+          firstHandoff,
+          "/intermediate",
+          async (previous, path) => {
+            applied.push({ previous, project: path });
+          },
+        ),
+      ),
+    );
+    const secondHandoff = beginProjectFolderPreferenceHandoff(ref, "/intermediate");
+    const firstCancelled = expect(firstEventual).rejects.toThrow("project wait was cancelled");
+    const secondEventual = waitForProject(ref, {
+      workspaceRoot: "/final",
+      timeoutMs: null,
+      signal: secondHandoff.signal,
+    }).then(() =>
+      serializeProjectFolderUpdate(ref, () =>
+        applyProjectFolderPreferenceHandoff(secondHandoff, "/final", async (previous, path) => {
+          applied.push({ previous, project: path });
+        }),
+      ),
+    );
+
+    await firstCancelled;
+    await publish([snapshot(20, "/intermediate")]);
+    expect(applied).toEqual([]);
+    await publish([snapshot(30, "/final")]);
+    await secondEventual;
+    expect(applied).toEqual([{ previous: "/old", project: "/final" }]);
   });
 });
