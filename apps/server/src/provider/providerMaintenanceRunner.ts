@@ -228,6 +228,35 @@ function isStillInstalled(provider: ServerProvider): boolean {
   return provider.installed && (provider.driver === "cursor" || Boolean(provider.version?.trim()));
 }
 
+function hasSameEntries(
+  left: Readonly<Record<string, string | undefined>> | undefined,
+  right: Readonly<Record<string, string | undefined>> | undefined,
+): boolean {
+  const leftEntries = Object.entries(left ?? {});
+  const rightEntries = Object.entries(right ?? {});
+  return (
+    leftEntries.length === rightEntries.length &&
+    leftEntries.every(([key, value]) => right?.[key] === value)
+  );
+}
+
+function isSameMaintenanceAction(
+  selected: ProviderMaintenanceCommandAction,
+  current: ProviderMaintenanceCommandAction | null,
+): boolean {
+  return (
+    current !== null &&
+    current.installationKey === selected.installationKey &&
+    current.lockKey === selected.lockKey &&
+    current.executable === selected.executable &&
+    current.args.length === selected.args.length &&
+    current.args.every((arg, index) => arg === selected.args[index]) &&
+    current.windowsInstaller?.manager === selected.windowsInstaller?.manager &&
+    current.windowsInstaller?.scope === selected.windowsInstaller?.scope &&
+    hasSameEntries(current.env, selected.env)
+  );
+}
+
 function makeUpdateState(input: {
   readonly status: ServerProviderUpdateState["status"];
   readonly startedAt: string | null;
@@ -401,7 +430,8 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               provider,
               { fresh: true },
             );
-            if (!fresh.update || fresh.update.lockKey !== update.lockKey) {
+            const freshUpdate = fresh.update;
+            if (!freshUpdate || !isSameMaintenanceAction(update, freshUpdate)) {
               return yield* finish(
                 makeUpdateState({
                   status: "failed",
@@ -417,11 +447,10 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                 (candidate) => candidate.driver === provider && candidate.instanceId === instanceId,
               )
               ?.version?.trim();
-            let result: ProviderMaintenanceCommandResult = yield* runMaintenanceCommand(
-              fresh.update,
-            );
+            let result: ProviderMaintenanceCommandResult =
+              yield* runMaintenanceCommand(freshUpdate);
             const needsElevation =
-              platform === "win32" && requiresWindowsAdministrator(fresh.update, result);
+              platform === "win32" && requiresWindowsAdministrator(freshUpdate, result);
             if (needsElevation) {
               yield* setUpdateState(
                 makeUpdateState({
@@ -431,7 +460,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                   message: "Approve the Windows administrator prompt to update this provider.",
                 }),
               );
-              const elevatedUpdate = fresh.update;
+              const elevatedUpdate = freshUpdate;
               result = yield* Effect.gen(function* () {
                 const elevated = yield* prepareWindowsUpdateElevation(
                   elevatedUpdate,
@@ -460,7 +489,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             // WinGet reports "no applicable update" as a nonzero exit. Still
             // verify the selected provider instead of presenting this as failure.
             if (
-              fresh.update.windowsInstaller?.manager === "winget" &&
+              freshUpdate.windowsInstaller?.manager === "winget" &&
               result.exitCode !== null &&
               result.exitCode >>> 0 === 0x8a15002b
             ) {
@@ -493,6 +522,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               verified,
               instanceId,
             );
+            const installationChanged = !isSameMaintenanceAction(freshUpdate, verified.update);
             // "Succeeded" needs the provider to still be installed: an
             // installer that exits 0 and leaves the binary missing is not a
             // success. Only Cursor tolerates a missing version, since its
@@ -503,27 +533,35 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             const stillOutdated = verifiedProviders.some((verifiedProvider) =>
               isOutdatedProvider(verifiedProvider),
             );
-            const versionUnchanged =
-              provider !== "cursor" &&
-              !verifiedProviders.some(
-                (verifiedProvider) =>
-                  verifiedProvider.version?.trim() &&
-                  (!versionBeforeUpdate ||
-                    compareSemverVersions(versionBeforeUpdate, verifiedProvider.version) < 0),
-              );
+            const versionAdvanced = verifiedProviders.some(
+              (verifiedProvider) =>
+                verifiedProvider.version?.trim() &&
+                (!versionBeforeUpdate ||
+                  compareSemverVersions(versionBeforeUpdate, verifiedProvider.version) < 0),
+            );
+            // Cursor can be healthy without a readable version. That unknown
+            // baseline remains compatible, but a known version must advance
+            // just like every other provider before the update is successful.
+            const versionUnchanged = versionBeforeUpdate
+              ? !versionAdvanced
+              : provider !== "cursor" && !versionAdvanced;
             return yield* finish(
               makeUpdateState({
                 status:
-                  couldNotVerify || stillOutdated || versionUnchanged ? "unchanged" : "succeeded",
+                  installationChanged || couldNotVerify || stillOutdated || versionUnchanged
+                    ? "unchanged"
+                    : "succeeded",
                 startedAt,
                 finishedAt,
-                message: couldNotVerify
-                  ? "Update command completed, but T3 Code could not verify the provider version."
-                  : stillOutdated
-                    ? "Update command completed, but T3 Code still detects an outdated provider version."
-                    : versionUnchanged
-                      ? "Update command completed, but the provider version did not advance."
-                      : "Provider updated.",
+                message: installationChanged
+                  ? "Update command completed, but the selected provider installation changed before it could be verified."
+                  : couldNotVerify
+                    ? "Update command completed, but T3 Code could not verify the provider version."
+                    : stillOutdated
+                      ? "Update command completed, but T3 Code still detects an outdated provider version."
+                      : versionUnchanged
+                        ? "Update command completed, but the provider version did not advance."
+                        : "Provider updated.",
                 output: commandOutput(result),
               }),
             );

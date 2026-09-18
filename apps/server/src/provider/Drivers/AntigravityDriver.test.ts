@@ -60,7 +60,11 @@ function shellQuote(value: string): string {
 }
 
 const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
-  options: { readonly config?: Partial<AntigravitySettings>; readonly enabled?: boolean } = {},
+  options: {
+    readonly config?: Partial<AntigravitySettings>;
+    readonly enabled?: boolean;
+    readonly externalScoop?: boolean;
+  } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -75,7 +79,9 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   );
   const requestLog = path.join(root, "requests.jsonl");
   const profileDirectory = resolveAntigravityProfileDirectory(config.stateDir, instanceId);
-  const instancePath = `${path.join(root, "instance-bin")}:${baseEnv.PATH ?? ""}`;
+  let instancePath = [path.join(root, "instance-bin"), baseEnv.PATH ?? ""]
+    .filter(Boolean)
+    .join(windowsHost ? ";" : ":");
 
   const makeExecutable = Effect.fn("AntigravityDriverTest.makeExecutable")(function* (
     name: string,
@@ -113,7 +119,37 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   const first = yield* makeExecutable("runtime 'one");
   const second = yield* makeExecutable("runtime two");
   const signedOut = yield* makeExecutable("runtime signed-out", true);
-  const controls = { selected: first, failResolution: false, beforeAcquire: Effect.void };
+  let selected: AntigravityExecutable = first;
+  if (options.externalScoop) {
+    const scoopRoot = path.join(root, "Scoop Root");
+    const app = "fixture-antigravity-runtime";
+    const current = path.join(scoopRoot, "apps", app, "current");
+    const executablePath = path.join(current, "agy_acp_server.exe");
+    const harnessPath = path.join(current, "localharness_external.exe");
+    const manager = path.join(scoopRoot, "shims", "scoop.cmd");
+    const selectedAlias = path.join(scoopRoot, "shims", "agy_acp_server.exe");
+    yield* fs.makeDirectory(current, { recursive: true });
+    yield* fs.makeDirectory(path.dirname(manager), { recursive: true });
+    yield* fs.writeFileString(executablePath, "fixture");
+    yield* fs.writeFileString(harnessPath, "fixture");
+    yield* fs.writeFileString(path.join(current, "install.json"), '{"bucket":"fixture"}');
+    yield* fs.writeFileString(manager, "@echo off\r\n");
+    yield* fs.writeFileString(selectedAlias, "fixture shim");
+    yield* fs.writeFileString(
+      `${selectedAlias.slice(0, -4)}.shim`,
+      `path = "${executablePath}"\r\n`,
+    );
+    instancePath = [path.dirname(manager), instancePath].join(windowsHost ? ";" : ":");
+    selected = {
+      executablePath,
+      resolvedCommandPath: selectedAlias,
+      harnessPath,
+      source: "override",
+      version: null,
+      managedVersionDirectory: null,
+    };
+  }
+  const controls = { selected, failResolution: false, beforeAcquire: Effect.void };
   const acquisitions: Array<{ binaryPath: string | undefined; path: string | undefined }> = [];
   const releases: Array<string | null> = [];
   const launches: Array<{
@@ -531,6 +567,50 @@ it.layer(testLayer)("AntigravityDriver", (it) => {
       expect(snapshot.version).toBe(h.first.version);
       expect(h.launches).toEqual([]);
       expect(h.acquisitions).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps managed runtimes out of command-based maintenance", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      h.controls.selected = {
+        ...h.first,
+        source: "override",
+        resolvedCommandPath: h.first.executablePath,
+      };
+      expect((yield* h.instance.snapshot.resolveMaintenance({ fresh: true })).update).toBeNull();
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(!windowsHost)(
+    "updates an external Antigravity ACP pair through its owning Scoop app",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness({ externalScoop: true });
+        const update = (yield* h.instance.snapshot.resolveMaintenance({ fresh: true })).update;
+        expect(update).toMatchObject({
+          args: ["update", "fixture/fixture-antigravity-runtime"],
+          windowsInstaller: { manager: "scoop", scope: "user" },
+        });
+        expect(update?.installationKey).toContain("fixture-antigravity-runtime");
+        expect(h.launches).toEqual([]);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(!windowsHost)("keeps unproven WinGet ACP paths manual-only", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const directory = h.path.join("C:\\Users\\fixture", "Microsoft", "WinGet", "Packages");
+      h.controls.selected = {
+        executablePath: h.path.join(directory, "agy_acp_server.exe"),
+        resolvedCommandPath: h.path.join(directory, "agy_acp_server.exe"),
+        harnessPath: h.path.join(directory, "localharness_external.exe"),
+        source: "override",
+        version: null,
+        managedVersionDirectory: null,
+      };
+      expect((yield* h.instance.snapshot.resolveMaintenance({ fresh: true })).update).toBeNull();
+      expect(h.launches).toEqual([]);
     }).pipe(Effect.scoped),
   );
 });

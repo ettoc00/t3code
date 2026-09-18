@@ -96,4 +96,64 @@ it.layer(testLayer)("CursorDriver", (it) => {
       Effect.scoped,
     ),
   );
+
+  it.effect.skipIf(!windowsHost)("uses Scoop for an owned Windows Cursor CLI", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cursor-scoop-" });
+      const current = NodePath.join(root, "apps", "cursor-agent", "current");
+      const target = NodePath.join(current, "cursor-agent.exe");
+      const shim = NodePath.join(root, "shims", "cursor-agent.exe");
+      const manager = NodePath.join(root, "shims", "scoop.cmd");
+      yield* fs.makeDirectory(current, { recursive: true });
+      yield* fs.makeDirectory(NodePath.dirname(shim), { recursive: true });
+      yield* fs.writeFileString(target, "fixture");
+      yield* fs.writeFileString(shim, "fixture");
+      yield* fs.writeFileString(shim.replace(/\.exe$/i, ".shim"), `path = "${target}"`);
+      yield* fs.writeFileString(NodePath.join(current, "install.json"), '{"bucket":"extras"}');
+      yield* fs.writeFileString(manager, "@echo off\r\n");
+
+      const instance = yield* CursorDriver.create({
+        instanceId: ProviderInstanceId.make("cursor-scoop"),
+        displayName: "Cursor Scoop",
+        enabled: false,
+        environment: [{ name: "PATH", value: NodePath.dirname(manager), sensitive: false }],
+        config: { ...CursorDriver.defaultConfig(), binaryPath: shim },
+      });
+      expect((yield* instance.snapshot.resolveMaintenance({ fresh: true })).update).toMatchObject({
+        args: ["update", "extras/cursor-agent"],
+        windowsInstaller: { manager: "scoop", scope: "user" },
+      });
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Scoop ownership must not spawn a probe")),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.effect.skipIf(!windowsHost)("keeps unproven WinGet Cursor CLI paths manual-only", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cursor-winget-" });
+      const binaryPath = NodePath.join(root, "Microsoft", "WinGet", "Packages", "cursor-agent.exe");
+      yield* fs.makeDirectory(NodePath.dirname(binaryPath), { recursive: true });
+      yield* fs.writeFileString(binaryPath, "fixture");
+      const instance = yield* CursorDriver.create({
+        instanceId: ProviderInstanceId.make("cursor-winget"),
+        displayName: "Cursor WinGet",
+        enabled: false,
+        environment: [],
+        config: { ...CursorDriver.defaultConfig(), binaryPath },
+      });
+      expect((yield* instance.snapshot.resolveMaintenance({ fresh: true })).update).toBeNull();
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Unknown WinGet ownership must not spawn")),
+      ),
+      Effect.scoped,
+    ),
+  );
 });

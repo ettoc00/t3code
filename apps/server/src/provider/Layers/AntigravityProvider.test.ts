@@ -20,6 +20,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { AcpSessionRuntimeStartResult } from "../acp/AcpSessionRuntime.ts";
+import { makeProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   buildAntigravityModelsFromSession,
   makeAntigravityProvider,
@@ -230,6 +231,40 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
         });
         expect(yield* Ref.get(harness.probeCalls)).toBe(0);
         expect(yield* Ref.get(harness.safetyCalls)).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect("publishes an explicit update action when external ownership is proven", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const capabilities = makeProviderMaintenanceCapabilities({
+          provider: driver,
+          packageName: null,
+          updateExecutable: "scoop",
+          updateArgs: ["update", "fixture/fixture-antigravity-runtime"],
+          updateLockKey: "scoop:c:/scoop",
+          updateInstallationKey: "scoop:c:/scoop:fixture-antigravity-runtime",
+          latestVersion: null,
+        });
+        const provider = yield* makeAntigravityProvider(decodeSettings({ enabled: false }), {
+          stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
+          probe: Effect.die("Disabled Antigravity must not probe"),
+          supportsTextGeneration: Effect.succeed(false),
+          resolveMaintenance: () => Effect.succeed(capabilities),
+        });
+        const advisory = yield* Stream.toPull(
+          provider.snapshot.streamChanges.pipe(
+            Stream.filter((snapshot) => snapshot.versionAdvisory?.canUpdate === true),
+          ),
+        );
+        yield* provider.snapshot.refresh;
+        const [snapshot] = yield* advisory;
+        expect(snapshot.versionAdvisory).toMatchObject({
+          status: "unknown",
+          canUpdate: true,
+          updateCommand: "scoop update fixture/fixture-antigravity-runtime",
+        });
       }),
     ),
   );

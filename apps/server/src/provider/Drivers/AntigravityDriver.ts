@@ -58,12 +58,26 @@ import {
   type ProviderInstance,
 } from "../ProviderDriver.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import {
+  makeCachedProviderMaintenanceResolution,
+  makeManualOnlyProviderMaintenanceCapabilities,
+  makePackageManagedProviderMaintenanceResolver,
+} from "../providerMaintenance.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
 const isNodeRuntimeUnavailableError = Schema.is(NodeRuntimeUnavailableError);
+const MANUAL_MAINTENANCE = makeManualOnlyProviderMaintenanceCapabilities({
+  provider: DRIVER,
+  packageName: null,
+});
+const EXTERNAL_UPDATE = makePackageManagedProviderMaintenanceResolver({
+  provider: DRIVER,
+  npmPackageName: null,
+  nativeUpdate: null,
+});
 
 export type AntigravityDriverEnv =
   | AntigravityInstallation
@@ -102,7 +116,28 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       };
       const authConfigIssue = antigravityAuthConfigIssue(auth);
       const processEnvironment = mergeProviderInstanceEnvironment(environment);
-      const userHome = resolveAntigravityUserHome(yield* HostProcessPlatform, processEnvironment);
+      const platform = yield* HostProcessPlatform;
+      const userHome = resolveAntigravityUserHome(platform, processEnvironment);
+      const resolveMaintenance = yield* makeCachedProviderMaintenanceResolution(
+        installation.resolve(settings.binaryPath, processEnvironment).pipe(
+          Effect.flatMap((executable) =>
+            executable.managedVersionDirectory !== null
+              ? Effect.succeed(MANUAL_MAINTENANCE)
+              : EXTERNAL_UPDATE.resolve({
+                  binaryPath: settings.binaryPath || executable.executablePath,
+                  resolvedCommandPath: executable.resolvedCommandPath ?? executable.executablePath,
+                  realCommandPath: executable.executablePath,
+                  env: processEnvironment,
+                  platform,
+                }),
+          ),
+          Effect.orElseSucceed(() => MANUAL_MAINTENANCE),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.provideService(HostProcessPlatform, platform),
+        ),
+      );
       const profileDirectory = resolveAntigravityProfileDirectory(
         serverConfig.stateDir,
         instanceId,
@@ -357,6 +392,7 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         stampIdentity: classifyModels,
         probe,
         auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+        resolveMaintenance,
         supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),

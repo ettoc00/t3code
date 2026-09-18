@@ -76,6 +76,8 @@ const isInstallationError = Schema.is(AntigravityInstallationError);
 
 export interface AntigravityExecutable {
   readonly executablePath: string;
+  /** Selected alias before realpath resolution, when an external install supplied one. */
+  readonly resolvedCommandPath?: string;
   readonly harnessPath: string;
   readonly source: "override" | "managed" | "path";
   readonly version: string | null;
@@ -367,7 +369,23 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     source: "override" | "path",
   ) {
     if (!(yield* executableFile(candidate))) return null;
-    const executablePath = yield* fs.realPath(candidate);
+    let executablePath = yield* fs.realPath(candidate);
+    if (platform === "win32" && /(?:^|[\\/])shims[\\/][^\\/]+\.exe$/iu.test(candidate)) {
+      const shimPath = candidate.replace(/\.exe$/iu, ".shim");
+      const shimInfo = yield* fs.stat(shimPath).pipe(Effect.option);
+      if (
+        Option.isSome(shimInfo) &&
+        shimInfo.value.type === "File" &&
+        Number(shimInfo.value.size) <= RECORD_MAX_BYTES
+      ) {
+        const contents = yield* fs.readFileString(shimPath);
+        const targets = [...contents.matchAll(/^\s*path\s*=\s*"([^"\r\n]+)"\s*$/gimu)];
+        const target = targets.length === 1 ? targets[0]![1]! : null;
+        if (target && path.isAbsolute(target) && (yield* executableFile(target))) {
+          executablePath = yield* fs.realPath(target);
+        }
+      }
+    }
     const directory = path.dirname(executablePath);
     const harnessPath = path.join(directory, names.harness);
     if (!(yield* executableFile(harnessPath))) return null;
@@ -378,10 +396,17 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       /^[a-f0-9]{64}$/u.test(path.basename(directory))
     ) {
       const installed = yield* completedRelease(path.basename(directory));
-      return { ...installed, executablePath, harnessPath, source } satisfies AntigravityExecutable;
+      return {
+        ...installed,
+        executablePath,
+        resolvedCommandPath: candidate,
+        harnessPath,
+        source,
+      } satisfies AntigravityExecutable;
     }
     return {
       executablePath,
+      resolvedCommandPath: candidate,
       harnessPath,
       source,
       version: null,

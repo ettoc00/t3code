@@ -741,6 +741,8 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           ["npm", "tool.cmd"],
           ["shims", "tool.cmd"],
           ["apps", "node", "global", "tool.cmd"],
+          ["apps", "node", "global", "tool"],
+          ["apps", "node", "global", "tool.exe"],
         ]) {
           const native = segments[0] === ".local";
           const binary = NodePath.join(NodePath.dirname(f.root), ...segments);

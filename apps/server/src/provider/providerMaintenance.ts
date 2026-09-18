@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import { resolveCommandPath, resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Config from "effect/Config";
@@ -75,6 +76,8 @@ export interface ProviderMaintenanceCommandAction {
   readonly command: string;
   readonly executable: string;
   readonly args: ReadonlyArray<string>;
+  /** Stable identity of the owned installation selected by this action. */
+  readonly installationKey: string;
   readonly lockKey: string;
   /** Proven Windows installer and scope; machine installs may request a UAC retry. */
   readonly windowsInstaller?: {
@@ -113,7 +116,7 @@ export interface ProviderMaintenanceCapabilitiesResolver {
 
 export interface PackageManagedProviderMaintenanceDefinition {
   readonly provider: ProviderDriverKind;
-  readonly npmPackageName: string;
+  readonly npmPackageName: string | null;
   readonly wingetPackageId?: string;
   readonly nativeUpdate: {
     readonly args: ReadonlyArray<string>;
@@ -166,6 +169,7 @@ export function makeProviderMaintenanceCapabilities(input: {
   readonly updateExecutable: string | null;
   readonly updateArgs: ReadonlyArray<string>;
   readonly updateLockKey: string | null;
+  readonly updateInstallationKey?: string | null;
   /** Shown to the user instead of `<executable> <args>`; use for a bare tool name like `brew`. */
   readonly updateCommand?: string;
   readonly platform?: NodeJS.Platform;
@@ -186,6 +190,7 @@ export function makeProviderMaintenanceCapabilities(input: {
             ].join(" "),
           executable: input.updateExecutable,
           args: input.updateArgs,
+          installationKey: input.updateInstallationKey ?? input.updateLockKey,
           lockKey: input.updateLockKey,
           ...(input.env ? { env: input.env } : {}),
           ...(input.windowsInstaller ? { windowsInstaller: input.windowsInstaller } : {}),
@@ -422,16 +427,11 @@ const readWingetPortableIndex = Effect.fn("readWingetPortableIndex")(
   function* (filename: string) {
     const fs = yield* FileSystem.FileSystem;
     if (Number((yield* fs.stat(filename)).size) > INSTALLER_PROBE_MAX_BYTES) return null;
-    const sqlite = yield* Effect.promise(async () =>
-      process.versions.bun !== undefined
-        ? await import("@effect/sql-sqlite-bun/SqliteClient")
-        : await import("@t3tools/shared/nodeSqliteClient"),
-    );
     return yield* Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       return yield* sql`SELECT filepath, filetype, symlinktarget FROM portable`;
     }).pipe(
-      Effect.provide(sqlite.layer({ filename, readonly: true })),
+      Effect.provide(NodeSqliteClient.layer({ filename, readonly: true })),
       Effect.flatMap(
         Schema.decodeUnknownEffect(
           Schema.Array(
@@ -482,6 +482,7 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
     executable: string,
     args: string[],
     lockKey: string,
+    installationKey: string,
     latestVersion: Exclude<ProviderMaintenanceCapabilities["latestVersion"], undefined>,
     env = context.env,
   ) =>
@@ -492,6 +493,7 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
       updateExecutable: executable,
       updateArgs: args,
       updateLockKey: lockKey,
+      updateInstallationKey: installationKey,
       platform: context.platform,
       env,
       latestVersion,
@@ -499,16 +501,16 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
 
   const observed = context.resolvedCommandPath.replaceAll("\\", "/");
   // npm prefixes can contain "shims" or "apps" without belonging to Scoop.
-  const npmShim =
-    /\.cmd$/i.test(observed) &&
+  const npmOwned =
+    definition.npmPackageName !== null &&
     (yield* resolveNpmGlobalPrefix(context, definition.npmPackageName)) !== null;
-  const shim = npmShim ? null : /^(.*)\/shims\/[^/]+\.(?:exe|cmd|ps1)$/i.exec(observed);
+  const shim = npmOwned ? null : /^(.*)\/shims\/[^/]+\.(?:exe|cmd|ps1)$/i.exec(observed);
   if (shim && !/\.exe$/i.test(observed)) return manual;
   const shimText = shim ? yield* read(observed.replace(/\.exe$/i, ".shim")) : null;
   const targets = [...(shimText ?? "").matchAll(/^\s*path\s*=\s*"([^"\r\n]+)"\s*$/gim)];
   const target = shim ? (targets.length === 1 ? targets[0]![1]! : null) : context.realCommandPath;
   const scoop =
-    !npmShim &&
+    !npmOwned &&
     target &&
     /^(.*)\/apps\/([\w.-]+)\/[^/]+\/(.+)$/i.exec(target.replaceAll("\\", "/"));
   if (shim || scoop) {
@@ -555,6 +557,9 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
       ["update", `${bucket}/${app}`, ...(global ? ["--global"] : [])],
       // Updating any app may first refresh this manager and its shared buckets.
       `scoop:${canonical((yield* realPath(managerRoot)) ?? managerRoot)}`,
+      `scoop:${canonical(root)}:${bucket.toLowerCase()}:${app.toLowerCase()}:${canonical(
+        path.join(current, relative),
+      )}`,
       // Local bucket manifests can be stale; keep an explicit update check available.
       null,
       { ...context.env, SCOOP: managerRoot, ...(global ? { SCOOP_GLOBAL: root } : {}) },
@@ -563,7 +568,14 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
 
   const packageId = definition.wingetPackageId;
   // Proven npm ownership must survive an inconclusive Windows registry probe.
-  if (!packageId || npmShim) return null;
+  if (npmOwned) return null;
+  if (!packageId) {
+    return /\/microsoft\/winget\//i.test(
+      `${observed}/${context.realCommandPath.replaceAll("\\", "/")}`,
+    )
+      ? manual
+      : null;
+  }
   const registry = path.join(context.env.SystemRoot ?? "C:\\Windows", "System32", "reg.exe");
   const currentVersion = "Software\\Microsoft\\Windows\\CurrentVersion";
   const uninstall = `${currentVersion}\\Uninstall`;
@@ -715,6 +727,9 @@ const resolveWindowsInstaller = Effect.fn("resolveWindowsInstaller")(function* (
       ...unattended,
     ],
     `winget:${sourceId}:${packageId}:${scope}:${canonical(context.realCommandPath)}`,
+    `winget:${sourceId}:${packageId}:${scope}:${canonical(
+      values.get("InstallLocation") ?? path.dirname(context.realCommandPath),
+    )}:${canonical(path.basename(context.realCommandPath))}`,
     latest,
   );
 });
@@ -758,42 +773,50 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
       updateExecutable: context.resolvedCommandPath,
       updateArgs: nativeUpdate.args,
       updateLockKey: `${definition.provider}-native`,
+      updateInstallationKey: `${definition.provider}-native:${normalizeCommandPath(
+        context.resolvedCommandPath,
+      )}`,
       platform: context.platform,
       ...(nativeUpdate.env ? { env: nativeUpdate.env } : {}),
     });
   }
-  if (commandPaths.some(isVitePlusGlobalCommandPath)) {
+  if (packageName && commandPaths.some(isVitePlusGlobalCommandPath)) {
     return makeProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName,
       updateExecutable: "vp",
       updateArgs: ["i", "-g", packageName],
       updateLockKey: "vite-plus-global",
+      updateInstallationKey: `vite-plus-global:${normalizeCommandPath(
+        context.resolvedCommandPath,
+      )}`,
     });
   }
-  if (commandPaths.some(isBunGlobalCommandPath)) {
+  if (packageName && commandPaths.some(isBunGlobalCommandPath)) {
     return makeProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName,
       updateExecutable: "bun",
       updateArgs: ["i", "-g", `${packageName}@latest`],
       updateLockKey: "bun-global",
+      updateInstallationKey: `bun-global:${normalizeCommandPath(context.resolvedCommandPath)}`,
     });
   }
-  if (commandPaths.some(isPnpmGlobalCommandPath)) {
+  if (packageName && commandPaths.some(isPnpmGlobalCommandPath)) {
     return makeProviderMaintenanceCapabilities({
       provider: definition.provider,
       packageName,
       updateExecutable: "pnpm",
       updateArgs: ["add", "-g", `${packageName}@latest`],
       updateLockKey: "pnpm-global",
+      updateInstallationKey: `pnpm-global:${normalizeCommandPath(context.resolvedCommandPath)}`,
     });
   }
 
   // npm proof names the package, so it outranks a keg the path merely passes
   // through: a Homebrew-installed Node keeps its globals under
   // `Cellar/node/<ver>/lib/node_modules/`, and that is npm's install, not brew's.
-  const npmPrefix = yield* resolveNpmGlobalPrefix(context, packageName);
+  const npmPrefix = packageName ? yield* resolveNpmGlobalPrefix(context, packageName) : null;
   if (npmPrefix) {
     // npm 12 blocks install scripts by default (empty allow-scripts allowlist)
     // and still exits 0, so a package whose postinstall finishes the install
@@ -813,6 +836,7 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
         `${packageName}@latest`,
       ],
       updateLockKey: `npm-global:${normalizeCommandPath(npmPrefix)}`,
+      updateInstallationKey: `npm-global:${normalizeCommandPath(npmPrefix)}:${packageName}`,
     });
   }
 
@@ -858,6 +882,9 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
       updateExecutable: brewPath,
       updateArgs: args,
       updateLockKey: "homebrew",
+      updateInstallationKey: `homebrew:${normalizeCommandPath(
+        realBrewPrefix,
+      )}:${homebrew.kind}:${homebrew.name.toLowerCase()}`,
       updateCommand: ["brew", ...args].join(" "),
       latestVersion: info ? parseHomebrewLatestVersion(info, homebrew) : null,
     });

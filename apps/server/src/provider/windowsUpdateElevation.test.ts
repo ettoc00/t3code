@@ -50,6 +50,7 @@ for (const { mode, expectedCode } of [
             command: "fixture",
             executable: cmd ? shim : process.execPath,
             args: cmd ? args : [script, ...args],
+            installationKey: "fixture",
             lockKey: "fixture",
             env: {
               T3_UPDATE_TEST: "value ' with spaces & $data",

@@ -47,6 +47,8 @@ const maintenanceCapabilities = {
 
     args: ["install", "-g", "@openai/codex@latest"],
 
+    installationKey: "npm-global",
+
     lockKey: "npm-global",
   },
 } as const;

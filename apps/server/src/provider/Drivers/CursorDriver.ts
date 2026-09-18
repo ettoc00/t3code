@@ -45,9 +45,7 @@ import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
   makeProviderMaintenanceResolution,
-  makeManualOnlyProviderMaintenanceCapabilities,
-  makeProviderMaintenanceCapabilities,
-  type ProviderMaintenanceCapabilitiesResolver,
+  makePackageManagedProviderMaintenanceResolver,
 } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
@@ -58,26 +56,14 @@ import { discoverCursorSkills, probeCursorSkills } from "./CursorSkills.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("cursor");
-// cursor-agent updates itself, so the resolved executable is its own updater.
-// No executable means nothing to update, not "whatever is on PATH".
-const UPDATE: ProviderMaintenanceCapabilitiesResolver = {
-  resolve: (context) =>
-    Effect.succeed(
-      context
-        ? makeProviderMaintenanceCapabilities({
-            provider: DRIVER_KIND,
-            packageName: null,
-            updateExecutable: context.resolvedCommandPath,
-            updateArgs: ["update"],
-            updateLockKey: "cursor-agent",
-            platform: context.platform,
-          })
-        : makeManualOnlyProviderMaintenanceCapabilities({
-            provider: DRIVER_KIND,
-            packageName: null,
-          }),
-    ),
-};
+// Official Cursor CLI installs update themselves. Package-manager ownership
+// still wins on Windows so a Scoop-managed copy is not allowed to mutate its
+// files behind Scoop; WinGet stays manual without a proven CLI package id.
+const UPDATE = makePackageManagedProviderMaintenanceResolver({
+  provider: DRIVER_KIND,
+  npmPackageName: null,
+  nativeUpdate: { args: ["update"], isCommandPath: () => true },
+});
 
 export type CursorDriverEnv =
   | BackgroundPolicy.BackgroundPolicy

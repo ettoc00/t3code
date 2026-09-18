@@ -21,6 +21,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import type { AcpSessionRuntimeStartResult } from "../acp/AcpSessionRuntime.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
+  createProviderVersionAdvisory,
   makeManualOnlyProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
@@ -31,6 +32,7 @@ import {
 } from "../providerSnapshot.ts";
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+const DRIVER = ProviderDriverKind.make("antigravity");
 const MAX_WORKSPACE_SNAPSHOTS = 32;
 const HEALTH_CHECK_TIMEOUT = "90 seconds";
 const SIGN_IN_MESSAGE = "Sign in with Google to use Antigravity.";
@@ -124,6 +126,7 @@ interface AntigravityProviderOptions {
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
+  readonly resolveMaintenance?: () => Effect.Effect<ProviderMaintenanceCapabilities>;
   /** Auth type and label published once a session authenticates. */
   readonly auth?: { readonly type: string; readonly label: string };
 }
@@ -240,19 +243,35 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       provider: ProviderDriverKind.make("antigravity"),
       packageName: null,
     });
+  const resolveMaintenance =
+    options.resolveMaintenance ?? (() => Effect.succeed(maintenanceCapabilities));
   const managed = yield* makeManagedServerProvider({
-    resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+    resolveMaintenance,
     getSettings: Effect.succeed(settings),
     streamSettings: Stream.empty,
     haveSettingsChanged: () => false,
     initialSnapshot: () => getSnapshot,
     checkProvider: checkProvider(),
-    enrichSnapshot: ({ publishSnapshot }) =>
-      SubscriptionRef.changes(metadata).pipe(
-        Stream.runForEach((state) =>
-          options.stampIdentity(state.draft).pipe(Effect.flatMap(publishSnapshot)),
-        ),
-      ),
+    enrichSnapshot: ({ snapshot, publishSnapshot }) =>
+      Effect.gen(function* () {
+        const capabilities = yield* resolveMaintenance();
+        const publishWithMaintenance = (nextSnapshot: ServerProvider) =>
+          publishSnapshot({
+            ...nextSnapshot,
+            versionAdvisory: createProviderVersionAdvisory({
+              driver: DRIVER,
+              currentVersion: nextSnapshot.version,
+              checkedAt: nextSnapshot.checkedAt,
+              maintenanceCapabilities: capabilities,
+            }),
+          });
+        yield* publishWithMaintenance(snapshot);
+        yield* SubscriptionRef.changes(metadata).pipe(
+          Stream.runForEach((state) =>
+            options.stampIdentity(state.draft).pipe(Effect.flatMap(publishWithMaintenance)),
+          ),
+        );
+      }),
   });
 
   const onSessionStarted = Effect.fn("AntigravityProvider.onSessionStarted")(function* (

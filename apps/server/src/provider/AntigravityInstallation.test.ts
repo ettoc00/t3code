@@ -737,6 +737,7 @@ it.layer(NodeServices.layer)("Antigravity installation", (it) => {
         });
         expect(yield* installation.resolve(externalExecutable)).toMatchObject({
           executablePath: externalExecutable,
+          resolvedCommandPath: externalExecutable,
           source: "override",
           managedVersionDirectory: null,
         });
@@ -768,11 +769,56 @@ it.layer(NodeServices.layer)("Antigravity installation", (it) => {
         ).toMatchObject({
           source: "path",
           executablePath: externalExecutable,
+          resolvedCommandPath: externalExecutable,
         });
         expect(
           yield* isolated.installation.resolve(executableName, { PATH: externalDirectory }),
         ).toMatchObject({ source: "override", executablePath: externalExecutable });
       }),
+  );
+
+  it.effect.skipIf(hostPlatform !== "win32")(
+    "preserves a selected Scoop alias while resolving its paired runtime",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-scoop-test-" });
+        const scoopRoot = path.join(baseDir, "Scoop Root");
+        const current = path.join(scoopRoot, "apps", "fixture-antigravity-runtime", "current");
+        const shims = path.join(scoopRoot, "shims");
+        const executable = path.join(current, executableName);
+        const harness = path.join(current, harnessName);
+        const alias = path.join(shims, executableName);
+        yield* fs.makeDirectory(current, { recursive: true });
+        yield* fs.makeDirectory(shims, { recursive: true });
+        yield* fs.writeFileString(executable, serverContents);
+        yield* fs.writeFileString(harness, harnessContents);
+        yield* fs.writeFileString(alias, "scoop shim");
+        yield* fs.writeFileString(alias.replace(/\.exe$/iu, ".shim"), `path = "${executable}"\r\n`);
+        const { installation } = yield* makeHarness({ baseDir });
+
+        expect(yield* installation.resolve(alias)).toMatchObject({
+          executablePath: executable,
+          resolvedCommandPath: alias,
+          harnessPath: harness,
+          source: "override",
+          managedVersionDirectory: null,
+        });
+      }),
+  );
+
+  it.effect("recognizes an explicitly selected managed release by directory identity", () =>
+    Effect.gen(function* () {
+      const { installation } = yield* makeHarness({ previous: true });
+      const managed = yield* installation.resolve();
+      expect(yield* installation.resolve(managed.executablePath)).toMatchObject({
+        executablePath: managed.executablePath,
+        resolvedCommandPath: managed.executablePath,
+        source: "override",
+        managedVersionDirectory: managed.managedVersionDirectory,
+      });
+    }),
   );
 
   it.effect("keeps leased releases available while new sessions resolve the new release", () =>

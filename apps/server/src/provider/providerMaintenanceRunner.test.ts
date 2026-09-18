@@ -318,6 +318,7 @@ describe("providerMaintenanceRunner", () => {
                   command: "winget upgrade",
                   executable: "C:\\Tools\\winget.exe",
                   args: ["upgrade"],
+                  installationKey: "selected-winget",
                   lockKey: "selected-winget",
                   windowsInstaller: { manager: "winget", scope: "machine" },
                 },
@@ -468,6 +469,7 @@ describe("providerMaintenanceRunner", () => {
                           "--scope",
                           scenario.eligible ? "machine" : "user",
                         ],
+                  installationKey: "selected-installer",
                   lockKey: "selected-installer",
                   ...(scenario.verified
                     ? {
@@ -512,7 +514,7 @@ describe("providerMaintenanceRunner", () => {
   it.effect("runs the allowlisted provider update command and records success", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     return Effect.gen(function* () {
-      const { registry, updateStatesRef } = yield* makeRegistry(baseCursorProvider);
+      const { registry, updateStatesRef } = yield* makeRegistry(baseCursorProvider, "0.0.1");
       const updater = yield* makeTestRunner(registry);
 
       const result = yield* updater.updateProvider(CURSOR_DRIVER);
@@ -609,33 +611,46 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect(
-    "keeps a successful update when the binary is present but its version is unreadable",
-    () => {
-      return Effect.gen(function* () {
-        const { registry, providersRef } = yield* makeRegistry(baseCursorProvider);
-        // Cursor's `agent about` probe can fail right after an update while the
-        // new binary is perfectly fine.
-        const updater = yield* makeTestRunner({
-          ...registry,
-          refreshInstance: () =>
-            Ref.updateAndGet(providersRef, (providers) =>
-              providers.map((provider) => ({ ...provider, installed: true, version: null })),
-            ),
-        });
-
-        const result = yield* updater.updateProvider(CURSOR_DRIVER);
-        assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            NonWindowsPlatform,
-            latestVersionHttpClient("0.0.0"),
-            mockSpawnerLayer(() => ({ stdout: "updated" })),
+  it.effect("does not claim success when a known Cursor version becomes unreadable", () => {
+    return Effect.gen(function* () {
+      const { registry, providersRef } = yield* makeRegistry(baseCursorProvider);
+      // A missing post-update version cannot prove that the known install advanced.
+      const updater = yield* makeTestRunner({
+        ...registry,
+        refreshInstance: () =>
+          Ref.updateAndGet(providersRef, (providers) =>
+            providers.map((provider) => ({ ...provider, installed: true, version: null })),
           ),
+      });
+
+      const result = yield* updater.updateProvider(CURSOR_DRIVER);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.0"),
+          mockSpawnerLayer(() => ({ stdout: "updated" })),
         ),
-      );
-    },
+      ),
+    );
+  });
+
+  it.effect("allows Cursor's updater when both versions are unknown but the binary remains", () =>
+    Effect.gen(function* () {
+      const { registry } = yield* makeRegistry({ ...baseCursorProvider, version: null });
+      const updater = yield* makeTestRunner(registry);
+      const result = yield* updater.updateProvider(CURSOR_DRIVER);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.0"),
+          mockSpawnerLayer(() => ({ stdout: "updated" })),
+        ),
+      ),
+    ),
   );
 
   it.effect("spawns the updater with the environment its capabilities declare", () => {
@@ -651,6 +666,7 @@ describe("providerMaintenanceRunner", () => {
               command: "codex update",
               executable: "/work/codex-home/packages/standalone/bin/codex",
               args: ["update"],
+              installationKey: "codex-native",
               lockKey: "codex-native",
               env: { CODEX_HOME: "/work/codex-home" },
             },
@@ -673,7 +689,7 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect("re-resolves ownership before running and executes the fresh command", () => {
+  it.effect("re-resolves stable ownership before and after running the command", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     const fresh: Array<boolean> = [];
     return Effect.gen(function* () {
@@ -686,7 +702,7 @@ describe("providerMaintenanceRunner", () => {
             makeProviderMaintenanceCapabilities({
               provider,
               packageName: "@openai/codex",
-              updateExecutable: options?.fresh ? "/opt/homebrew/bin/brew" : "brew",
+              updateExecutable: "/opt/homebrew/bin/brew",
               updateArgs: ["upgrade", "--cask", "codex"],
               updateLockKey: "homebrew",
             }),
@@ -754,6 +770,165 @@ describe("providerMaintenanceRunner", () => {
             calls.push(command);
             return { stdout: "updated" };
           }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("rejects a different Scoop app under the same manager lock", () => {
+    const calls: Array<string> = [];
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider);
+      const capabilities = (installationKey: string, env = { SCOOP: "C:/Scoop" }) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: "C:/Scoop/shims/scoop.cmd",
+          updateArgs: ["update", installationKey],
+          updateLockKey: "scoop:c:/scoop",
+          updateInstallationKey: `scoop:c:/scoop:${installationKey}`,
+          env,
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) =>
+          Effect.succeed(capabilities(options?.fresh ? "extras/codex" : "main/codex")),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(calls, []);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
+      assert.strictEqual(
+        result.providers[0]?.updateState?.message,
+        "Provider installation changed. Refresh and try again.",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer((command) => {
+            calls.push(command);
+            return { stdout: "updated" };
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("rejects a changed selected-instance environment before execution", () => {
+    const calls: Array<string> = [];
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider);
+      const capabilities = (home: string) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: "codex",
+          updateArgs: ["update"],
+          updateLockKey: "codex-native",
+          updateInstallationKey: "codex-native:c:/tools/codex.exe",
+          env: { CODEX_HOME: home },
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) =>
+          Effect.succeed(capabilities(options?.fresh ? "C:/new home" : "C:/selected home")),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(calls, []);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer((command) => {
+            calls.push(command);
+            return { stdout: "updated" };
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("rejects a different updater executable before execution", () => {
+    const calls: Array<string> = [];
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider);
+      const capabilities = (executable: string) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: executable,
+          updateArgs: ["update", "main/codex"],
+          updateLockKey: "scoop:c:/scoop",
+          updateInstallationKey: "scoop:c:/scoop:main:codex",
+          env: { SCOOP: "C:/Scoop" },
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) =>
+          Effect.succeed(
+            capabilities(options?.fresh ? "C:/Scoop/shims/scoop.exe" : "C:/Scoop/shims/scoop.cmd"),
+          ),
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.deepStrictEqual(calls, []);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer((command) => {
+            calls.push(command);
+            return { stdout: "updated" };
+          }),
+        ),
+      ),
+    );
+  });
+
+  it.effect("does not accept a fallback installation after an update", () => {
+    let freshReads = 0;
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider, "0.0.1");
+      const capabilities = (installationKey: string) =>
+        makeProviderMaintenanceCapabilities({
+          provider: CODEX_DRIVER,
+          packageName: "@openai/codex",
+          updateExecutable: "C:/Scoop/shims/scoop.cmd",
+          updateArgs: ["update", "main/codex"],
+          updateLockKey: "scoop:c:/scoop",
+          updateInstallationKey: installationKey,
+          env: { SCOOP: "C:/Scoop" },
+        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        getProviderMaintenanceCapabilitiesForInstance: (_instanceId, _provider, options) => {
+          if (!options?.fresh) return Effect.succeed(capabilities("scoop:selected"));
+          freshReads += 1;
+          return Effect.succeed(
+            capabilities(freshReads === 1 ? "scoop:selected" : "scoop:fallback"),
+          );
+        },
+      });
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
+      assert.strictEqual(
+        result.providers[0]?.updateState?.message,
+        "Update command completed, but the selected provider installation changed before it could be verified.",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.0.1"),
+          mockSpawnerLayer(() => ({ stdout: "updated" })),
         ),
       ),
     );
